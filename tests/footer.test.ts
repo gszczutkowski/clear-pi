@@ -5,7 +5,7 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import clearPi from "../index.ts";
 import { parseSettings } from "../config.ts";
 import { branchTokens, colors, icons, quotaText, renderFooter } from "../footer.ts";
-import { CACHE_MS, UsageClient, parseUsage } from "../usage.ts";
+import { CACHE_MS, MIN_REFRESH_MS, RETRY_MS, UsageClient, parseUsage } from "../usage.ts";
 
 const theme = { fg: (_color: string, text: string) => `\x1b[32m${text}\x1b[39m` } as any;
 const usage = { input: 100, cacheRead: 200, cacheWrite: 30, output: 40, totalTokens: 9999 };
@@ -39,7 +39,7 @@ test("actual footer component renders requested Unicode, Windows cwd, metrics an
     await h.commands.get("clear-pi").handler("refresh", h.ctx);
     let lines = h.component().render(300).map(strip);
     assert.equal(lines.length, 2);
-    assert.equal(lines[0], `E:\\Repositories\\界面 (${icons.git} main)`);
+    assert.equal(lines[0], `${icons.cwd} E:\\Repositories\\界面 (${icons.git} main)`);
     assert.match(lines[1], new RegExp(`${icons.model} gpt-mock • ${icons.thinking} high • ${icons.sent} 330 • ${icons.received} 40 • ${icons.context} 12.5%`));
     assert.match(lines[1], /Codex login required/);
     h.statuses.set("other", "\x1b[31mwide 界面\x1b[0m\nstatus");
@@ -47,7 +47,7 @@ test("actual footer component renders requested Unicode, Windows cwd, metrics an
     h.statuses.set("clear-pi", "obsolete own status");
     lines = h.component().render(300).map(strip);
     assert.equal(lines.length, 3);
-    assert.equal(lines[2], "wide 界面 status");
+    assert.equal(lines[2], `${icons.statuses} wide 界面 status`);
     for (let width = 0; width <= 250; width++) {
       for (const line of h.component().render(width)) {
         assert.ok(visibleWidth(line) <= width, `overflow at ${width}: ${strip(line)}`);
@@ -74,8 +74,28 @@ test("footer fields can be hidden independently without empty lines or separator
   h.statuses.set("test", "hidden status");
   const render = (options: typeof fields) => renderFooter(h.ctx, theme, h.data as any, undefined, 200, 0, options).map(strip);
   assert.deepEqual(render(fields), [`${icons.git} main`]);
-  assert.deepEqual(render({ ...fields, gitBranch: false, model: true }), [`${icons.model} gpt-mock`]);
-  assert.deepEqual(render({ ...fields, gitBranch: false }), []);
+  const noGit = { ...fields, gitBranch: { ...fields.gitBranch, enabled: false } };
+  assert.deepEqual(render({ ...noGit, model: { ...fields.model, enabled: true } }), [`${icons.model} gpt-mock`]);
+  assert.deepEqual(render(noGit), []);
+});
+
+test("every configured footer icon is rendered independently and can be blank", () => {
+  const h = harness();
+  const client = new UsageClient({ now: () => 0, fetch: async () => { throw new Error("no network"); } });
+  client.snapshot = { at: 0, blocked: false, windows: [{ used: 25, resetAt: 60_000 }] };
+  h.statuses.set("test", "status");
+  const footer = parseSettings({ footer: {
+    cwd: { icon: "📁" }, gitBranch: { icon: "枝" }, model: { icon: "" }, thinking: { icon: "T" },
+    sent: { icon: "↑" }, received: { icon: "↓" }, context: { icon: "C" }, codexQuota: { icon: "@" },
+    extensionStatuses: { icon: "i" },
+  } }).footer;
+  const render = (width: number) => renderFooter(h.ctx, theme, h.data as any, client, width, 0, footer).map(strip);
+  const [path, metrics, statuses] = render(300);
+  assert.equal(path, "📁 E:\\Repositories\\界面 (枝 main)");
+  assert.match(metrics, /^gpt-mock • T high • ↑ 330 • ↓ 40 • C 12\.5% • Codex .* • @ 1m$/);
+  assert.equal(statuses, "i status");
+  assert.equal(quotaText(client, 0, 8, false, false, ""), "Codex primary [▰▰▰▰▰▰▱▱] 75% • 1m");
+  for (let width = 1; width <= 100; width++) assert.ok(render(width).every(line => visibleWidth(line) <= width));
 });
 
 test("semantic colors use exact thresholds and leave base fields unstyled", () => {
@@ -125,6 +145,65 @@ test("active-branch tokens include cache, tool and summary usage without totalTo
   }
 });
 
+test("footer caches active branch tokens and context until the session, leaf, entry count or model changes", () => {
+  const h = harness();
+  let sessionId = "session-a", leafId = "branch-a", entryCount = 2;
+  let entries: unknown[] = [assistant];
+  let percent: number | null = 12.5;
+  let branchReads = 0, contextReads = 0;
+  h.ctx.model.contextWindow = 1000;
+  h.ctx.sessionManager = {
+    getSessionId: () => sessionId, getLeafId: () => leafId, getEntryCount: () => entryCount,
+    getEntries: () => { throw new Error("must not copy all session entries"); },
+    getBranch: () => { branchReads++; return entries; },
+  };
+  h.ctx.getContextUsage = () => { contextReads++; return { percent }; };
+  const render = (width = 300) => strip(renderFooter(h.ctx, theme, h.data as any, undefined, width)[1]);
+  assert.ok(render().includes(`${icons.sent} 330`));
+  assert.ok(render(250).includes("12.5%"));
+  assert.deepEqual([branchReads, contextReads], [1, 1]);
+
+  leafId = "branch-b";
+  entries = [];
+  percent = 0;
+  assert.ok(render().includes(`${icons.sent} 0`));
+  assert.ok(render().includes("0.0%"));
+  assert.deepEqual([branchReads, contextReads], [2, 2]);
+
+  h.ctx.model = { ...h.ctx.model, id: "next-model", contextWindow: 2000 };
+  percent = 6.25;
+  assert.ok(render().includes("6.3%"));
+  assert.deepEqual([branchReads, contextReads], [3, 3]);
+
+  // Count changes are independently sufficient, even at an unchanged leaf.
+  entryCount++;
+  entries = [assistant, { type: "usage", usage }];
+  assert.ok(render().includes(`${icons.sent} 660`));
+  assert.deepEqual([branchReads, contextReads], [4, 4]);
+
+  leafId = "compaction";
+  entryCount++;
+  entries.push({ type: "compaction", usage });
+  percent = null;
+  const compacted = render();
+  assert.ok(compacted.includes(`${icons.sent} 990`));
+  assert.ok(compacted.includes(`${icons.context} ?%`));
+  assert.equal(render(), compacted);
+  assert.deepEqual([branchReads, contextReads], [5, 5]);
+
+  sessionId = "session-b";
+  entries = [];
+  assert.ok(render().includes(`${icons.sent} 0`));
+  assert.deepEqual([branchReads, contextReads], [6, 6]);
+
+  h.ctx.model = { ...h.ctx.model, api: "pi-virtual" };
+  percent = 11;
+  assert.ok(render().includes("11.0%"));
+  percent = 22; // Routed model limits aren't available on the extension context.
+  assert.ok(render().includes("22.0%"));
+  assert.deepEqual([branchReads, contextReads], [7, 8]);
+});
+
 test("quota rendering: bars, both windows, reset countdown, unknown, stale, error and limited", () => {
   const client = new UsageClient({ now: () => 0, fetch: async () => { throw new Error("no network"); } });
   assert.equal(quotaText(client, 0), "Codex loading");
@@ -154,45 +233,85 @@ test("quota rendering: bars, both windows, reset countdown, unknown, stale, erro
   client.dispose();
 });
 
-test("lifecycle: cache preserved, active branch switch, timer repaint, provider switch and idempotent cleanup", async () => {
-  const original = globalThis.fetch;
-  let calls = 0;
-  const token = `header.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "mock-account" } })).toString("base64url")}.signature`;
-  globalThis.fetch = async () => { calls++; return Response.json({ rate_limit: { primary_window: { used_percent: 25 } } }); };
+test("quota schedules only countdown, expiry and retry work; provider switch and shutdown cancel it", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout", "setInterval"], now: 1_800_000_000_000 });
   const h = harness();
-  h.ctx.modelRegistry.getProviderAuth = async () => ({ auth: { apiKey: token } });
+  let calls = 0, authCalls = 0, unavailable = false;
+  const token = `header.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "mock-account" } })).toString("base64url")}.signature`;
+  const resetAt = (Date.now() + CACHE_MS + 630_000) / 1000;
+  t.mock.method(globalThis, "fetch", async () => {
+    calls++;
+    return unavailable ? new Response(null, { status: 500 })
+      : Response.json({ rate_limit: { primary_window: { used_percent: 25, reset_at: resetAt } } });
+  });
+  h.ctx.modelRegistry.getProviderAuth = async () => { authCalls++; return { auth: { apiKey: token } }; };
+  const other = { ...h.ctx, model: { provider: "other", id: "other-model" } };
+  const command = (args: string, ctx = h.ctx) => h.commands.get("clear-pi").handler(args, ctx);
+  const tick = async (ms: number) => { t.mock.timers.tick(ms); await new Promise(resolve => setImmediate(resolve)); };
+  const line = () => strip(h.component().render(300)[1]);
   try {
-    h.events.get("session_start")!({}, h.ctx);
-    await h.commands.get("clear-pi").handler("refresh", h.ctx);
-    assert.equal(calls, 1);
-    await h.commands.get("clear-pi").handler("", h.ctx);
-    assert.equal(calls, 1);
+    h.events.get("session_start")!({}, other);
+    let before = h.renders();
+    await tick(CACHE_MS);
+    await command("refresh", other);
+    assert.deepEqual([h.renders() - before, authCalls, calls], [0, 0, 0]);
+
     h.events.get("model_select")!({}, h.ctx);
+    await command("refresh");
+    assert.ok(line().includes(`${icons.reset} 11m`));
     assert.equal(calls, 1);
-    const before = h.renders();
-    await new Promise(resolve => setTimeout(resolve, 1050));
-    assert.ok(h.renders() > before);
-    assert.equal(calls, 1);
-    h.ctx.sessionManager.getBranch = () => [];
-    h.events.get("session_tree")!({}, h.ctx);
-    assert.ok(strip(h.component().render(300)[1]).includes(`${icons.sent} 0`));
-    const other = { ...h.ctx, model: { provider: "other", id: "other-model" } };
+    h.events.get("model_select")!({}, { ...h.ctx, model: { ...h.ctx.model, id: "another-codex" } });
+    before = h.renders();
+    await tick(MIN_REFRESH_MS - 1);
+    await command("");
+    await command("refresh");
+    assert.deepEqual([h.renders() - before, calls], [0, 1]);
+    await tick(1);
+    await command("refresh");
+    assert.deepEqual([h.renders() - before, calls], [0, 2]); // Same result, no repaint.
+    await tick(19_999);
+    assert.equal(h.renders(), before);
+    await tick(1);
+    assert.ok(line().includes(`${icons.reset} 10m`));
+    assert.deepEqual([h.renders() - before, calls], [1, 2]);
+
+    unavailable = true;
+    await tick(CACHE_MS - 20_001);
+    assert.equal(calls, 2);
+    await tick(1);
+    assert.equal(calls, 3);
+    assert.match(line(), /stale \(unavailable\)/);
+    await tick(RETRY_MS - 1);
+    assert.equal(calls, 3);
+    before = h.renders();
+    await tick(1);
+    assert.deepEqual([h.renders() - before, calls], [0, 4]);
+
     h.events.get("model_select")!({}, other);
-    assert.match(strip(h.component().render(300)[1]), /other-model.*unsupported provider/);
+    assert.match(line(), /other-model.*unsupported provider/);
+    before = h.renders();
+    await tick(CACHE_MS);
+    assert.deepEqual([h.renders() - before, authCalls, calls], [0, 4, 4]);
+    h.events.get("model_select")!({}, h.ctx);
+    await command("refresh");
+    assert.equal(calls, 5);
     const retired = h.component();
     h.events.get("session_shutdown")!({}, h.ctx);
     h.events.get("session_shutdown")!({}, h.ctx);
-    const stopped = h.renders();
+    before = h.renders();
     h.switchGit("late");
-    assert.equal(h.renders(), stopped);
+    await tick(CACHE_MS);
     assert.deepEqual(retired.render(300), []);
     assert.equal(h.unsubscribed(), 1);
     for (const mode of ["print", "json", "rpc"]) {
-      h.events.get("session_start")!({}, { ...h.ctx, mode });
+      const nonTui = { ...h.ctx, mode };
+      h.events.get("session_start")!({}, nonTui);
+      await command("refresh", nonTui);
       assert.equal(h.component(), undefined);
     }
-    assert.equal(calls, 1);
-  } finally { h.events.get("session_shutdown")!({}, h.ctx); globalThis.fetch = original; }
+    await tick(CACHE_MS);
+    assert.deepEqual([h.renders() - before, authCalls, calls], [0, 5, 5]);
+  } finally { h.events.get("session_shutdown")!({}, h.ctx); }
 });
 
 test("shutdown aborts pending quota and prevents late footer updates", async () => {

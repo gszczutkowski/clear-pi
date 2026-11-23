@@ -1,19 +1,36 @@
 {
   "frames": {
-    "userPrompt": { "enabled": true, "title": "User prompt", "color": "#595959" },
-    "agentActivity": { "enabled": true, "title": "Agent activity", "color": "#4DA3FF" },
-    "agentAnswer": { "enabled": true, "title": "Agent answer", "color": "#2F9E5D" },
-    "subagentMessage": { "enabled": true, "title": "Message from {sender}", "color": "#D69E2E" }
+    "userPrompt": {
+      "enabled": true,
+      "title": "User prompt",
+      "color": "#4DA3FF"
+    },
+    "agentActivity": {
+      "enabled": true,
+      "title": "Agent activity",
+      "color": "#A78BCA"
+    },
+    "agentAnswer": {
+      "enabled": true,
+      "title": "Agent answer",
+      "color": "#3FBF78"
+    },
+    "subagentMessage": {
+      "enabled": true,
+      "title": "Message from {sender}",
+      "color": "#D69E2E"
+    }
   },
+  "progress": { "enabled": true, "details": false, "maxTasks": 12, "maxRuns": 20 },
   "footer": {
-    "cwd": true,
-    "gitBranch": true,
-    "model": true,
-    "thinking": true,
-    "sent": true,
-    "received": true,
-    "context": true,
-    "codexQuota": true,
-    "extensionStatuses": true
+    "cwd": { "enabled": true, "icon": "\uF07C" },
+    "gitBranch": { "enabled": true, "icon": "\uEC6F" },
+    "model": { "enabled": true, "icon": "\uE28C" },
+    "thinking": { "enabled": true, "icon": "\uEC59" },
+    "sent": { "enabled": true, "icon": "\uDB81\uDD52" },
+    "received": { "enabled": true, "icon": "\uDB80\uDDDA" },
+    "context": { "enabled": true, "icon": "\uDB80\uDE38" },
+    "codexQuota": { "enabled": true, "icon": "\uDB81\uDC50" },
+    "extensionStatuses": { "enabled": true, "icon": "\uF05A" }
   }
 }

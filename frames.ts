@@ -3,6 +3,7 @@ import {
   truncateToWidth, visibleWidth, type Component,
 } from "@earendil-works/pi-tui";
 import { safeTitle, type FrameOptions } from "./config.ts";
+import { frameContentLine, frameWidth } from "./frame-layout.ts";
 
 const reset = "\x1b[0m";
 const upstreamAmber = "\x1b[38;2;214;158;46m";
@@ -18,26 +19,32 @@ function top(title: string, width: number, color: string): string {
 const bottom = (width: number, color: string) => `${color}╰${"─".repeat(width - 2)}╯${reset}`;
 
 /** A display-only wrapper. The native child still owns Markdown, images and input. */
-export function framed(child: Component, options: FrameOptions): Component {
+export function framed(child: Component, options: FrameOptions, foreground?: string): Component {
+  return wrapFrame(child, options, true, foreground);
+}
+function wrapFrame(child: Component, options: FrameOptions, reserveMargin: boolean, foreground?: string): Component {
   if (!options.enabled) return child;
   let inset = 0;
+  let renderedWidth = 0;
   let body: string[] = [];
   let bordered = false;
   return {
     invalidate: () => child.invalidate(),
     render(width) {
+      width = reserveMargin ? frameWidth(width) : width;
+      renderedWidth = width;
       inset = width >= 6 ? 2 : width >= 3 ? 1 : 0;
       bordered = false;
       if (width < 1) return [];
       const inner = width - 2 * inset;
       body = child.render(inner);
       bordered = inset > 0 && body.some(hasContent);
-      if (!bordered) return body.map((line) => isImageLine(line) ? line : fits(line, width));
+      if (!bordered) return body.map((line) => isImageLine(line) ? line : fits(frameContentLine(line, foreground), width));
       const color = accent(options);
       const pad = inset === 2 ? " " : "";
       return [top(options.title, width, color), ...body.map((raw) => {
         if (isImageLine(raw)) return raw; // Don't prepend text to image transport sequences.
-        const line = fits(raw, inner);
+        const line = fits(frameContentLine(raw, foreground), inner);
         return `${color}│${reset}${pad}${line}${reset}${" ".repeat(inner - visibleWidth(line))}${pad}${color}│${reset}`;
       }), bottom(width, color)];
     },
@@ -45,7 +52,7 @@ export function framed(child: Component, options: FrameOptions): Component {
       if (!bordered) return child.handleMouse?.(event);
       const y = event.y - 1;
       const x = event.x - inset;
-      const width = event.width - 2 * inset;
+      const width = renderedWidth - 2 * inset;
       if (x < 0 || x >= width || y < 0 || y >= body.length) return undefined;
       return child.handleMouse?.({ ...event, x, y, width, height: body.length });
     },
@@ -55,14 +62,17 @@ export function framed(child: Component, options: FrameOptions): Component {
 /** Adopt the original pi-herdr-subagents card without copying its report renderer. */
 export function subagentFrame(child: Component, options: FrameOptions, sender: string): Component {
   const title = options.title.replaceAll("{sender}", () => sender);
-  const fallback = framed(child, { ...options, title });
+  const fallback = wrapFrame(child, { ...options, title }, false, "");
   let removed = false;
   let fallbackUsed = false;
+  let renderedWidth = 0;
   return {
     invalidate: () => child.invalidate(),
     render(width) {
       removed = false;
       fallbackUsed = false;
+      width = frameWidth(width);
+      renderedWidth = width;
       if (width < 1) return [];
       const lines = child.render(width);
       const first = lines.findIndex(hasContent);
@@ -86,13 +96,16 @@ export function subagentFrame(child: Component, options: FrameOptions, sender: s
       restyled[first] = top(title, width, color);
       restyled[last] = bottom(width, color);
       for (let i = first + 1; i < last; i++) {
-        restyled[i] = lines[i]
-          .replace(`${upstreamAmber}│${reset}`, () => `${color}│${reset}`)
-          .replace(/\x1b\[38;2;214;158;46m│\x1b\[0m$/, () => `${color}│${reset}`);
+        if (isImageLine(lines[i])) continue;
+        const raw = lines[i].replace(`${upstreamAmber}│${reset}`, "")
+          .replace(/\x1b\[38;2;214;158;46m│\x1b\[0m$/, "");
+        const content = fits(frameContentLine(raw, ""), width - 2);
+        restyled[i] = `${color}│${reset}${content}${reset}${" ".repeat(width - 2 - visibleWidth(content))}${color}│${reset}`;
       }
       return restyled;
     },
     // The original report currently has no mouse actions when its borders are removed.
-    handleMouse: (event) => fallbackUsed ? fallback.handleMouse?.(event) : removed ? undefined : child.handleMouse?.(event),
+    handleMouse: (event) => event.x >= renderedWidth ? undefined
+      : fallbackUsed ? fallback.handleMouse?.(event) : removed ? undefined : child.handleMouse?.({ ...event, width: renderedWidth }),
   };
 }

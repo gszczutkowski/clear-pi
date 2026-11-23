@@ -9,12 +9,22 @@ const frames: Record<FrameKind, FrameOptions> = {
   agentAnswer: { enabled: true, title: "Agent answer", color: "#2F9E5D" },
   subagentMessage: { enabled: true, title: "Message from {sender}", color: "#D69E2E" },
 };
+export interface FooterField { enabled: boolean; icon: string }
 export const defaultFooter = {
-  cwd: true, gitBranch: true, model: true, thinking: true, sent: true,
-  received: true, context: true, codexQuota: true, extensionStatuses: true,
-};
-export type FooterOptions = typeof defaultFooter;
-export interface Settings { frames: typeof frames; footer: FooterOptions }
+  cwd: { enabled: true, icon: "\uF07C" },
+  gitBranch: { enabled: true, icon: "\uEC6F" },
+  model: { enabled: true, icon: "\uE28C" },
+  thinking: { enabled: true, icon: "\uEC59" },
+  sent: { enabled: true, icon: "\u{F0552}" },
+  received: { enabled: true, icon: "\u{F01DA}" },
+  context: { enabled: true, icon: "\u{F0238}" },
+  codexQuota: { enabled: true, icon: "\u{F0450}" },
+  extensionStatuses: { enabled: true, icon: "\uF05A" },
+} satisfies Record<string, FooterField>;
+export type FooterOptions = Record<keyof typeof defaultFooter, FooterField>;
+export const defaultProgress = { enabled: true, details: false, maxTasks: 12, maxRuns: 20 };
+export type ProgressOptions = typeof defaultProgress;
+export interface Settings { frames: typeof frames; footer: FooterOptions; progress: ProgressOptions }
 
 const record = (value: unknown): Record<string, unknown> =>
   value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
@@ -27,8 +37,15 @@ export function parseSettings(value: unknown): Settings {
   const frameInput = record(input.frames);
   const footerInput = record(input.footer);
   for (const key of Object.keys(footer) as (keyof FooterOptions)[]) {
-    const enabled = footerInput[key];
-    if (typeof enabled === "boolean") footer[key] = enabled;
+    const input = footerInput[key];
+    const { enabled, icon } = record(input);
+    const defaults = defaultFooter[key];
+    const safeIcon = typeof icon === "string" && icon.length <= 24 && icon.isWellFormed()
+      && !/[\x00-\x1f\x7f-\x9f\u2028-\u202e\u2066-\u2069]/.test(icon);
+    footer[key] = {
+      enabled: typeof input === "boolean" ? input : typeof enabled === "boolean" ? enabled : defaults.enabled,
+      icon: safeIcon ? icon.trim() : defaults.icon,
+    };
   }
   const result = { ...frames };
   for (const key of Object.keys(frames) as (keyof typeof frames)[]) {
@@ -39,7 +56,16 @@ export function parseSettings(value: unknown): Settings {
       color: typeof color === "string" && /^#[\da-f]{6}$/i.test(color) ? color : frames[key].color,
     };
   }
-  return { frames: result, footer };
+  const progress = { ...defaultProgress };
+  const progressInput = record(input.progress);
+  for (const key of ["enabled", "details"] as const) {
+    if (typeof progressInput[key] === "boolean") progress[key] = progressInput[key];
+  }
+  for (const key of ["maxTasks", "maxRuns"] as const) {
+    const value = progressInput[key];
+    if (typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 100) progress[key] = value;
+  }
+  return { frames: result, footer, progress };
 }
 
 export function loadSettings(url = new URL("./config.json", import.meta.url)): { settings: Settings; warning?: string } {
