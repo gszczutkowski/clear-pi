@@ -1,0 +1,9 @@
+{
+  "name": "clear-pi",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "pi": { "extensions": ["./index.ts"] },
+  "scripts": { "test": "node --experimental-strip-types --import ./tests/register-pi.ts --test tests/*.test.ts" },
+  "peerDependencies": { "@earendil-works/pi-coding-agent": "*" }
+}

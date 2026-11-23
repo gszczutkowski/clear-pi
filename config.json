@@ -1,0 +1,19 @@
+{
+  "frames": {
+    "userPrompt": { "enabled": true, "title": "User prompt", "color": "#595959" },
+    "agentActivity": { "enabled": true, "title": "Agent activity", "color": "#4DA3FF" },
+    "agentAnswer": { "enabled": true, "title": "Agent answer", "color": "#2F9E5D" },
+    "subagentMessage": { "enabled": true, "title": "Message from {sender}", "color": "#D69E2E" }
+  },
+  "footer": {
+    "cwd": true,
+    "gitBranch": true,
+    "model": true,
+    "thinking": true,
+    "sent": true,
+    "received": true,
+    "context": true,
+    "codexQuota": true,
+    "extensionStatuses": true
+  }
+}
