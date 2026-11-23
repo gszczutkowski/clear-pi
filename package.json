@@ -4,6 +4,10 @@
   "private": true,
   "type": "module",
   "pi": { "extensions": ["./index.ts"] },
-  "scripts": { "test": "node --experimental-strip-types --import ./tests/register-pi.ts --test tests/*.test.ts" },
-  "peerDependencies": { "@earendil-works/pi-coding-agent": "*" }
+  "scripts": {
+    "test": "node --experimental-strip-types --import ./tests/register-pi.ts --test tests/*.test.ts",
+    "bench:progress": "node --experimental-strip-types ./tests/progress-data.bench.ts",
+    "bench:transcript": "node --experimental-strip-types --import ./tests/register-pi.ts ./tests/tool-groups.bench.ts"
+  },
+  "peerDependencies": { "@earendil-works/pi-coding-agent": "1.6.0" }
 }

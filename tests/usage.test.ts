@@ -123,6 +123,19 @@ test("account changes cannot display previous account's stale snapshot", async (
   assert.equal(client.snapshot, undefined);
   client.dispose();
 });
+test("display deadlines match hourly, minute, stale and reset-due transitions", () => {
+  const { client } = setup();
+  const resetAt = 25 * 60 * 60_000;
+  client.snapshot = { at: 0, blocked: false, windows: [{ used: 25, resetAt }] };
+  assert.equal(client.nextDisplayChangeAt(0), 60_000); // 1d1h → 1d0h.
+  assert.equal(client.nextDisplayChangeAt(60_000), CACHE_MS);
+  assert.equal(client.nextDisplayChangeAt(CACHE_MS), 61 * 60_000); // Days/hours → minutes.
+  assert.equal(client.nextDisplayChangeAt(61 * 60_000), 62 * 60_000);
+  assert.equal(client.nextDisplayChangeAt(resetAt - 1), resetAt);
+  assert.equal(client.nextDisplayChangeAt(resetAt), Infinity);
+  client.dispose();
+});
+
 test("reset expiry is stale, never fabricated as a replenished quota", async () => {
   const { client, advance } = setup();
   await client.refresh(auth); advance(3600001);

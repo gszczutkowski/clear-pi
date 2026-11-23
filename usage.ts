@@ -74,8 +74,11 @@ async function readUsage(response: Response): Promise<unknown> {
   }
 }
 
+const MINUTE_MS = 60_000;
+const durationMinutes = (ms: number) => Math.max(0, Math.ceil(ms / MINUTE_MS));
+
 export function duration(ms: number): string {
-  const minutes = Math.max(0, Math.ceil(ms / 60000));
+  const minutes = durationMinutes(ms);
   if (minutes < 60) return `${minutes}m`;
   if (minutes < 1440) return `${Math.floor(minutes / 60)}h${minutes % 60 ? `${minutes % 60}m` : ""}`;
   return `${Math.floor(minutes / 1440)}d${Math.floor(minutes % 1440 / 60)}h`;
@@ -93,11 +96,31 @@ export class UsageClient {
   private deps: { fetch: typeof fetch; now: () => number; timeoutMs?: number };
   constructor(deps: { fetch: typeof fetch; now: () => number; timeoutMs?: number }) { this.deps = deps; }
 
+  nextRefreshAt(force = false): number {
+    if (this.disposed || this.pending) return Infinity;
+    return this.lastAttempt + (force ? MIN_REFRESH_MS : this.failure ? RETRY_MS : CACHE_MS);
+  }
+
+  nextDisplayChangeAt(now: number): number {
+    const snapshot = this.snapshot;
+    if (!snapshot) return Infinity;
+    const expiry = snapshot.at + CACHE_MS;
+    const alreadyStale = this.failure || snapshot.windows.some(w => w.resetAt !== undefined && w.resetAt <= now);
+    let next = !alreadyStale && expiry > now ? expiry : Infinity;
+    for (const { resetAt } of snapshot.windows) {
+      if (resetAt === undefined || resetAt <= now) continue;
+      const minutes = durationMinutes(resetAt - now);
+      // The display omits minute precision while it shows days and hours.
+      const bucketStart = minutes >= 1440 ? Math.floor(minutes / 60) * 60 : minutes;
+      next = Math.min(next, resetAt - (bucketStart - 1) * MINUTE_MS);
+    }
+    return next;
+  }
+
   refresh(resolveAuth: () => Promise<Auth>, force = false): Promise<void> {
-    if (this.disposed) return Promise.resolve();
     if (this.pending) return this.pending;
     const now = this.deps.now();
-    if (now - this.lastAttempt < (force ? MIN_REFRESH_MS : this.failure ? RETRY_MS : CACHE_MS)) return Promise.resolve();
+    if (now < this.nextRefreshAt(force)) return Promise.resolve();
     this.lastAttempt = now;
     this.controller = new AbortController();
     const signal = this.controller.signal;
