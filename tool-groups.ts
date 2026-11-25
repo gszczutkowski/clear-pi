@@ -2,12 +2,35 @@ import * as Pi from "@earendil-works/pi-coding-agent";
 import { noticeCard, noticePreview, type NoticeContent } from "./notice-cards.ts";
 import { Container, foregroundAnsi, getTerminalColorMode, Markdown, parseColor, stripTerminalSequences, truncateToWidth, visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 import { defaultTranscriptIcons, defaultTranscriptNotices, safeTitle, type Settings, type TranscriptIcons, type FrameOptions } from "./config.ts";
-import { framed, hasContent, isImageLine, subagentFrame } from "./frames.ts";
+import { framed, hasContent, isImageLine } from "./frames.ts";
 const leadingMargin = /^((?:\x1b\[[\d;:]*m|\x1b\]133;[ABC]\x07)*)( {0,2})/;
 const activityGray = { light: parseColor("#595959"), dark: parseColor("#b0b0b0") };
 
 type ToolRow = Pi.ToolExecutionComponent;
-type RunRow = Pi.AssistantMessageComponent | ToolRow;
+type RunRow = Pi.AssistantMessageComponent | ToolRow | Pi.CustomMessageComponent;
+
+// Pi 1.6.0 stores these on the native rows; inspect only recognized schemas.
+function communication(row: Component): { peer: string; text: string; sent: boolean } | undefined {
+  const state = row as unknown as { toolName?: string; args?: Record<string, unknown>; message?: {
+    customType?: string; content?: unknown; details?: Record<string, unknown>;
+  } };
+  const message = state.message;
+  if (message && ["subagent_result", "subagent_ping"].includes(message.customType ?? "")) {
+    const details = message.details;
+    const text = message.customType === "subagent_ping" ? details?.message : message.content;
+    if (typeof text === "string" && typeof details?.name === "string") {
+      return { peer: safeTitle(`${details.name}${typeof details.agent === "string" && details.agent !== details.name ? ` (${details.agent})` : ""}`), text, sent: false };
+    }
+  }
+  const args = state.args;
+  const field = state.toolName === "subagent" ? "task"
+    : ["subagent_resume", "subagent_send", "caller_ping"].includes(state.toolName ?? "") ? "message" : undefined;
+  if (field && typeof args?.[field] === "string") {
+    const peer = args.name ?? args.agent ?? (state.toolName === "caller_ping" ? "Parent" : "Subagent");
+    if (typeof peer === "string" || typeof peer === "number") return { peer: safeTitle(String(peer)), text: args[field] as string, sent: true };
+  }
+}
+
 interface CachedRun {
   rows: readonly RunRow[];
   terminal: boolean;
@@ -206,7 +229,33 @@ export function mountToolGroups(
     const messageWidth = frames ? activityWidth(width) : width;
 
     for (const child of children) {
-      if (child instanceof Message) {
+      const exchange = communication(child);
+      if (exchange) {
+        const body = new Markdown(exchange.text, 0, 0, Pi.getMarkdownTheme());
+        sections.push({ kind: "other", component: {
+          invalidate() { body.invalidate(); },
+          render(width) {
+            const state = child instanceof Tool ? child as unknown as { result?: { isError?: boolean }; isPartial?: boolean } : undefined;
+            const status = state ? state.result?.isError ? " [failed]" : !state.result || state.isPartial ? " [pending]" : "" : "";
+            const action = state?.result?.isError ? "failed to send the message to" : exchange.sent ? "sent the message to" : "received message from";
+            const label = `I have ${action} ${exchange.peer}: ${noticePreview(exchange.text)}${status}`;
+            if (child instanceof Tool) syncRow(child, isExpanded(child));
+            return [truncateToWidth(`${theme.fg("accent", glyph(isExpanded(child)))} ${label}`, width),
+              ...(isExpanded(child) ? body.render(Math.max(1, width - 2)).map(line => truncateToWidth(`  ${line}`, width, "")) : []),
+              ...(isExpanded(child) && child instanceof Tool ? child.render(width) : [])];
+          },
+          handleMouse(event) {
+            if (event.y !== 0 || event.type !== "click" || event.button !== "left") return;
+            syncGlobal();
+            overrides.set(child, { revision, expanded: !isExpanded(child) });
+            if (runKey) completedRuns.delete(runKey);
+            tui.requestRender();
+            return { handled: true };
+          },
+        } });
+        assistant = undefined;
+        group = undefined;
+      } else if (child instanceof Message) {
         const lines = child.render(messageWidth);
         const first = lines.findIndex(hasContent);
         if (first === -1) continue; // Tool-only rounds do not break an existing section.
@@ -341,7 +390,7 @@ export function mountToolGroups(
     view.addChild(fragment);
     // Tool renderers and image conversion can update independently. Keep visible tools
     // and image transport live instead of relying on their private invalidation paths.
-    if (!expandedTools && !lines.some(isImageLine) && run.every((row) => {
+    if (!run.some(communication) && !expandedTools && !lines.some(isImageLine) && run.every((row) => {
       if (!(row instanceof Message)) return true;
       const { contentContainer, isStreaming } = assistantState(row);
       return contentContainer && isStreaming === false;
@@ -399,7 +448,7 @@ export function mountToolGroups(
         if (child instanceof Tool || (child instanceof Message && assistantState(child).lastMessage?.content.length)) nextWork = true;
       }
       for (const [index, child] of chat.children.entries()) {
-        if (child instanceof Message || child instanceof Tool) {
+        if (child instanceof Message || child instanceof Tool || (child instanceof Custom && communication(child))) {
           run.push(child);
           continue;
         }
@@ -418,24 +467,7 @@ export function mountToolGroups(
             }));
           } else view.addChild(child);
         } else if (child instanceof Custom) {
-          const message = (child as unknown as { message?: { customType?: string; details?: {
-            name?: unknown; agent?: unknown; message?: unknown; sessionFile?: unknown; keepOpen?: unknown;
-          } } }).message;
-          if (message?.customType === "subagent_ping" && notices.help.enabled && typeof message.details?.message === "string") {
-            const { name, agent, message: request, sessionFile, keepOpen } = message.details;
-            addNotice(child, notices.help, () => ({
-              summary: [["Name", typeof name === "string" ? name : "subagent"], ["Role", typeof agent === "string" ? agent : "—"]],
-              preview: ["Preview", noticePreview(request) || "—"],
-              details: [
-                ["Request", request], ...(typeof sessionFile === "string" ? [["Session", sessionFile] as const] : []),
-                ...(keepOpen === true ? [["Follow-up", "The existing pane was kept open."] as const] : []),
-              ],
-            }));
-          } else if (message?.customType === "subagent_result") {
-            const { name, agent } = message.details ?? {};
-            const sender = safeTitle(`${typeof name === "string" ? name : "subagent"}${typeof agent === "string" ? ` (${agent})` : ""}`);
-            view.addChild(subagentFrame(child, frames.subagentMessage, sender));
-          } else view.addChild(child);
+          view.addChild(child);
         } else view.addChild(child);
       }
       addRun(run, true, false, width, frames);

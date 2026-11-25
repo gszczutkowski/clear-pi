@@ -54,13 +54,11 @@ Edit [`config.json`](./config.json) next to `index.ts`, then run `/reload`. This
 | `userPrompt` | `User prompt` | `#4DA3FF` | `#595959` |
 | `agentActivity` | `Agent activity` | `#A78BCA` | `#4DA3FF` |
 | `agentAnswer` | `Agent answer` | `#3FBF78` | `#2F9E5D` |
-| `subagentMessage` | `Message from {sender}` | `#D69E2E` | `#D69E2E` |
+| `subagentMessage` (legacy; recognized messages now use `agentActivity`) | — | — | — |
 
-Each frame supports `enabled` (`true`/`false`), `title`, and `color` (`#RRGGBB`). Disabling a frame keeps the original content visible. The activity frame groups progress updates and tool calls; the answer frame encloses the final assistant text separately. Other Pi notices remain in order and may split activity frames. The prompt and amber subagent message use the terminal's default text and background colors. The activity body uses a single gray on the default background, with different shades for light and dark themes; its border keeps the configured color. The answer keeps Pi's styling. All clear-pi frames reserve two columns on the right for Pi's scrollbar/terminal edge. Native text is measured after tab expansion and removal of cursor/erase controls, so the right border stays aligned; hyperlinks and image transport are preserved.
+Each frame supports `enabled` (`true`/`false`), `title`, and `color` (`#RRGGBB`). Disabling a frame keeps the original content visible. The activity frame groups progress updates and tool calls; the answer frame encloses the final assistant text separately. Other Pi notices remain in order and may split activity frames. The prompt uses the terminal's default text and background colors. The activity body uses a single gray on the default background, with different shades for light and dark themes; its border keeps the configured color. The answer keeps Pi's styling. All clear-pi frames reserve two columns on the right for Pi's scrollbar/terminal edge. Native text is measured after tab expansion and removal of cursor/erase controls, so the right border stays aligned; hyperlinks and image transport are preserved.
 
-`transcriptNotices.skill` and `transcriptNotices.help` each support `enabled`, `title`, and `color`. Both default to enabled with an orange border (`#FF9F43`) and the titles `Skill invoked` and `Needs help`. Setting `enabled` to `false` restores Pi/herdr's native card for that notice type. See [Expanding skill and help cards](#expanding-skill-and-help-cards).
-
-The original amber renderer is in `pi-herdr-subagents/pi-extension/subagents/frame.ts` (`framedMessage` / `OPEN_ACCENT`), called by the `subagent_result` renderer in `pi-extension/subagents/index.ts`. With clear-pi loaded, `frames.subagentMessage` controls this result card's appearance without duplicating the report or replacing its expandable details. The subagent extension keeps its own fallback renderer when clear-pi is not loaded.
+`transcriptNotices.skill` supports `enabled`, `title`, and `color`, defaulting to an orange (`#FF9F43`) `Skill invoked` card. Setting `enabled` to `false` restores its native rendering. Legacy `transcriptNotices.help` and `frames.subagentMessage` settings remain accepted, but recognized subagent messages now use the activity frame instead of separate cards. Unrecognized messages retain their native renderer.
 
 Each `footer` field (`cwd`, `gitBranch`, `model`, `thinking`, `sent`, `received`, `context`, `codexQuota`, `extensionStatuses`) has `enabled` and `icon`. For example, `"cwd": { "enabled": true, "icon": "📁" }`. Set `"icon": ""` to keep the text without its icon, or `"enabled": false` to hide the field. Older `true`/`false` values still work and use the default icon. The `codexQuota` icon marks the reset countdown; disabling that field also stops quota fetching.
 
@@ -111,7 +109,11 @@ The grouping adapter uses Pi’s private interactive document layout. **Pi 1.6.0
 
 ### Expanding skill and help cards
 
-The orange cards start compact: **Skill invoked** shows the name and description; **Needs help** shows the sender, role and request preview. In fullscreen, click the card title or its `▸` arrow to toggle just that card. Expanded skill cards show the saved instructions; expanded help cards show the full request and the session path if recorded. In either TUI mode, Pi's **Ctrl+O** (`app.tools.expand`) expands or collapses all cards and resets individual choices. Expansion only changes what is displayed; it does not run a skill, send a reply, or resume a session.
+The orange **Skill invoked** card starts with its name and description; expanding shows the saved instructions.
+
+Subagent results and help requests appear inside **Agent activity** as `▸ I have received message from Worker: preview`. Assignments and follow-up messages use `▸ I have sent the message to Worker: preview`. Click a message row in fullscreen to reveal its full multiline content independently of tools and other messages. Unknown message schemas keep their native rendering.
+
+In either TUI mode, Pi's **Ctrl+O** (`app.tools.expand`) expands or collapses all groups and resets individual choices. Expansion only changes the display; it does not run a skill, send a reply, or resume a session.
 
 ## Metric meanings
 

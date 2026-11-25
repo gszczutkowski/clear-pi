@@ -49,6 +49,54 @@ function setup(arrowTheme = theme) {
 }
 const headings = (lines: string[]) => lines.filter((line) => /^[▸▾]/u.test(line));
 
+test("messages share activity in order and expand independently from ordinary tools", () => {
+  const { chat, mount, assistant, tool, render, mouse, setGlobal } = setup();
+  assistant("Before communication");
+  tool("subagent", { name: "Worker", task: "Initial assignment\nHidden assignment detail" });
+  chat.addChild(new CustomMessageComponent({ role: "custom", customType: "subagent_result", display: true,
+    timestamp: 0, content: "Incoming report\nHidden report detail", details: { name: "Scout" } }));
+  tool("subagent_resume", { name: "Reviewer", sessionPath: "/fixture", message: "Follow-up\nHidden follow-up detail" });
+  tool("caller_ping", { message: "Need decision\nHidden decision detail" });
+  tool("bash", { command: "echo ordinary" });
+  const cleanup = mount(parseSettings(undefined).frames);
+  let text = render().join("\n");
+  assert.equal(render().filter(line => line.startsWith("╭")).length, 1);
+  assert.match(text, /Before communication[\s\S]*sent the message to Worker: Initial assignment[\s\S]*received message from Scout: Incoming report[\s\S]*sent the message to Reviewer: Follow-up[\s\S]*sent the message to Parent: Need decision/);
+  assert.doesNotMatch(text, /Hidden|echo ordinary/);
+  const click = (name: string) => mouse(render().findIndex(line => line.includes(name)), { x: 3 });
+  assert.equal(click("received message from Scout")?.handled, true);
+  text = render().join("\n");
+  assert.match(text, /Hidden report detail/);
+  assert.doesNotMatch(text, /Hidden assignment|Hidden follow-up|echo ordinary/);
+  assert.equal(click("sent the message to Reviewer")?.handled, true);
+  assert.match(render().join("\n"), /Hidden follow-up detail/);
+  setGlobal(true);
+  assert.match(render().join("\n"), /Hidden assignment detail[\s\S]*Hidden report detail[\s\S]*Hidden follow-up detail[\s\S]*Hidden decision detail[\s\S]*echo ordinary/);
+  setGlobal(false);
+  assert.doesNotMatch(render().join("\n"), /Hidden|echo ordinary/);
+  cleanup();
+});
+
+test("communication failures remain visible and expandable, and peer identities are distinct", () => {
+  const { chat, tool, mount, render, mouse, setGlobal } = setup();
+  tool("subagent", { name: "Alpha", agent: "worker", task: "Launch task" }).updateResult({
+    content: [{ type: "text", text: "Launch denied" }], isError: true });
+  tool("subagent_resume", { sessionPath: "/private/session.jsonl", message: "Continue task" }).updateResult({
+    content: [{ type: "text", text: "Session unavailable" }], isError: true });
+  for (const name of ["Alpha", "Beta"]) chat.addChild(new CustomMessageComponent({ role: "custom",
+    customType: "subagent_result", content: "Report", display: true, timestamp: 0, details: { name, agent: "worker" } }));
+  const cleanup = mount(parseSettings(undefined).frames);
+  assert.match(render().join("\n"), /failed to send the message to Alpha: Launch task \[failed\]/);
+  assert.match(render().join("\n"), /failed to send the message to Subagent: Continue task \[failed\]/);
+  assert.match(render().join("\n"), /received message from Alpha \(worker\)[\s\S]*received message from Beta \(worker\)/);
+  assert.doesNotMatch(render().join("\n"), /private\/session|Launch denied|Session unavailable/);
+  mouse(render().findIndex(line => line.includes("failed to send the message to Alpha")), { x: 3 });
+  assert.match(render().join("\n"), /Launch denied/);
+  setGlobal(true);
+  assert.match(render().join("\n"), /Session unavailable/);
+  cleanup();
+});
+
 test("uses visible progress as independent headings and merges intervening tool-only rounds", () => {
   const { chat, ui, mount, tool, assistant, render, mouse } = setup();
   chat.addChild(new Text("User prompt", 0, 0));
@@ -370,15 +418,14 @@ test("adopts the upstream subagent frame without replacing its native content", 
   const frames = parseSettings({ frames: { subagentMessage: { title: "Agent: {sender}", color: "#E00078" } } }).frames;
   let cleanup = mount(frames);
   assert.equal(render().filter((line) => line.startsWith("╭")).length, 1);
-  assert.match(render().join("\n"), /Agent: Resume \(worker\)[\s\S]*Report/);
+  assert.match(render().join("\n"), /Agent activity[\s\S]*I have received message from Resume \(worker\): Report/);
   assert.ok(!ui.render(width).join("\n").includes(sunset));
   card.setExpanded(true);
-  assert.match(render().join("\n"), /Full report/);
+  assert.match(render().join("\n"), /Report/);
   cleanup();
   assert.match(render().join("\n"), /Message from Resume/);
   cleanup = mount({ ...frames, subagentMessage: { ...frames.subagentMessage, enabled: false } });
-  assert.doesNotMatch(render().join("\n"), /[╭│╯]/);
-  assert.match(render().join("\n"), /Full report/);
+  assert.match(render().join("\n"), /Agent activity[\s\S]*Report/);
   cleanup();
 });
 
@@ -519,27 +566,26 @@ test("skill and help notices expand independently by mouse and follow Ctrl+O", (
   };
   fitted();
   assert.match(text(), /▸ Skill invoked[\s\S]*Name: +release-create-notes[\s\S]*Description: +Use this skill/);
-  assert.match(text(), /▸ Needs help[\s\S]*Role: +feature-coordinator[\s\S]*Preview: +R2 worker/);
+  assert.match(text(), /▸ I have received message from F10.C kontynuacja testu styku/);
   assert.doesNotMatch(text(), /Private skill instructions|Second line of help|worker\.jsonl|native notice/);
-  const orange = foregroundAnsi(parseColor("#FF9F43"), getTerminalColorMode());
-  assert.ok(tui.render(width).some((line) => line.startsWith(orange + "╭")));
+  assert.doesNotMatch(text(), /Needs help|Message from/);
   const heading = (title: string) => render().findIndex((line) => line.startsWith("╭") && line.includes(title));
   assert.equal(mouse(heading("Skill invoked"), { x: width - 1 }), undefined);
   assert.equal(mouse(heading("Skill invoked"), { x: 3, button: "right" }), undefined);
   assert.equal(mouse(heading("Skill invoked"), { x: 3 })?.handled, true);
   assert.match(text(), /▾ Skill invoked[\s\S]*Instructions: +Private skill instructions[\s\S]*Second paragraph/);
-  assert.match(text(), /▸ Needs help/);
-  assert.equal(mouse(heading("Needs help"), { x: 3 })?.handled, true);
-  assert.match(text(), /▾ Needs help[\s\S]*Request: +R2 worker[\s\S]*Second line of help[\s\S]*Session: +\/sessions\/worker.jsonl[\s\S]*kept open/);
+  assert.match(text(), /▸ I have received/);
+  assert.equal(mouse(render().findIndex(line => line.includes("▸ I have received")), { x: 3 })?.handled, true);
+  assert.match(text(), /▾ I have received[\s\S]*Second line of help/);
   assert.doesNotMatch(text(), /Preview:/);
   fitted();
   assert.equal(mouse(heading("Skill invoked"), { x: 3 })?.handled, true);
   assert.doesNotMatch(text(), /Private skill instructions/);
   assert.match(text(), /Second line of help/);
   expanded = true;
-  assert.match(text(), /▾ Skill invoked[\s\S]*▾ Needs help/);
+  assert.match(text(), /▾ Skill invoked[\s\S]*▾ I have received/);
   expanded = false;
-  assert.match(text(), /▸ Skill invoked[\s\S]*▸ Needs help/);
+  assert.match(text(), /▸ Skill invoked[\s\S]*▸ I have received/);
   assert.doesNotMatch(text(), /Private skill instructions|Second line of help/);
 });
 
@@ -554,7 +600,7 @@ test("notice settings restore native rendering and customize titles and arrows i
   const settings = parseSettings({ transcriptNotices: { skill: { enabled: false }, help: { title: "Assistance" } },
     transcriptIcons: { collapsed: ">", expanded: "v" } });
   t.after(mountToolGroups(tui, theme, () => false, settings.frames, settings.transcriptIcons, undefined, settings.transcriptNotices));
-  assert.match(render().join("\n"), /\[skill\].*skill-title[\s\S]*Native help fallback[\s\S]*> Assistance/);
+  assert.match(render().join("\n"), /\[skill\].*skill-title[\s\S]*Native help fallback[\s\S]*> I have received message from worker: Some help/);
   setGlobal(true);
   assert.match(render().join("\n"), /Native expanded skill/);
 });
