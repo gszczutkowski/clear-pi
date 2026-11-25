@@ -1,5 +1,21 @@
 # clear-pi contributor instructions
 
+## GitHub authentication
+
+For local Git operations against GitHub (fetch, pull and push), use SSH key
+authentication and SSH remote URLs, for example
+`git@github.com:gszczutkowski/clear-pi.git`. Do not use HTTPS credentials,
+personal access tokens or `gh auth git-credential` as a fallback for Git transport.
+Before network operations, check `git remote -v`; if a remote uses HTTPS, ask for
+approval to switch it to SSH. If SSH authentication fails, report the problem
+and ask the user to configure the SSH key; do not generate, read or copy private
+keys or weaken SSH host-key verification.
+
+SSH authenticates Git transport, not the GitHub API. Commands such as `gh pr`
+and `gh api` still require separately authorized GitHub CLI/API authentication.
+This local SSH rule does not change GitHub Actions: hosted release workflows use
+their scoped `GITHUB_TOKEN` for tags and Releases, without storing SSH keys.
+
 ## Version every pull request
 
 Every PR targeting `main` must carry a stable SemVer version greater than the
