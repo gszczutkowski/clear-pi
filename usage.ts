@@ -2,9 +2,8 @@
 export const USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 export const CACHE_MS = 5 * 60_000;
 export const RETRY_MS = 60_000;
-export const MIN_REFRESH_MS = 10_000;
 export type Auth = { auth: { apiKey?: string; baseUrl?: string } } | undefined;
-export type Window = { used: number; seconds?: number; resetAt?: number };
+export type Window = { kind: "primary" | "secondary"; used: number; seconds?: number; resetAt?: number };
 export type Snapshot = { windows: Window[]; at: number; blocked: boolean };
 type Failure = "login required" | "unsupported auth" | "unsupported response" | "access denied" | "rate limited" | "unavailable" | "timeout";
 class UsageError extends Error {
@@ -18,8 +17,8 @@ const finite = (value: unknown): value is number => typeof value === "number" &&
 export function parseUsage(data: unknown, now: number): Snapshot {
   const limit = record(record(data)?.rate_limit);
   const windows: Window[] = [];
-  for (const key of ["primary_window", "secondary_window"]) {
-    const item = record(limit?.[key]);
+  for (const kind of ["primary", "secondary"] as const) {
+    const item = record(limit?.[`${kind}_window`]);
     if (!item) continue;
     if (!finite(item.used_percent) || item.used_percent < 0 || item.used_percent > 100) continue;
     const seconds = finite(item.limit_window_seconds) && item.limit_window_seconds > 0 ? item.limit_window_seconds : undefined;
@@ -27,7 +26,7 @@ export function parseUsage(data: unknown, now: number): Snapshot {
     if (finite(item.reset_at) && item.reset_at >= 0 && item.reset_at <= 8.64e12) resetAt = item.reset_at * 1000;
     else if (finite(item.reset_after_seconds) && item.reset_after_seconds >= 0 && item.reset_after_seconds <= 31536000)
       resetAt = now + item.reset_after_seconds * 1000;
-    windows.push({ used: item.used_percent, seconds, resetAt });
+    windows.push({ kind, used: item.used_percent, seconds, resetAt });
   }
   if (!windows.length) throw new UsageError("unsupported response");
   return { windows, at: now, blocked: limit?.allowed === false || limit?.limit_reached === true };
@@ -96,9 +95,9 @@ export class UsageClient {
   private deps: { fetch: typeof fetch; now: () => number; timeoutMs?: number };
   constructor(deps: { fetch: typeof fetch; now: () => number; timeoutMs?: number }) { this.deps = deps; }
 
-  nextRefreshAt(force = false): number {
+  nextRefreshAt(): number {
     if (this.disposed || this.pending) return Infinity;
-    return this.lastAttempt + (force ? MIN_REFRESH_MS : this.failure ? RETRY_MS : CACHE_MS);
+    return this.lastAttempt + (this.failure ? RETRY_MS : CACHE_MS);
   }
 
   nextDisplayChangeAt(now: number): number {
@@ -117,10 +116,10 @@ export class UsageClient {
     return next;
   }
 
-  refresh(resolveAuth: () => Promise<Auth>, force = false): Promise<void> {
+  refresh(resolveAuth: () => Promise<Auth>): Promise<void> {
     if (this.pending) return this.pending;
     const now = this.deps.now();
-    if (now < this.nextRefreshAt(force)) return Promise.resolve();
+    if (now < this.nextRefreshAt()) return Promise.resolve();
     this.lastAttempt = now;
     this.controller = new AbortController();
     const signal = this.controller.signal;
@@ -165,19 +164,6 @@ export class UsageClient {
         if (this.failure === "login required" || this.failure === "unsupported auth" || this.failure === "access denied") this.snapshot = undefined;
       }
     } finally { clearTimeout(timer); }
-  }
-
-  status(): string {
-    const snapshot = this.snapshot;
-    if (!snapshot) return `Codex usage: ${this.failure ?? "loading"}`;
-    const now = this.deps.now();
-    const windows = snapshot.windows.map((window, index) => {
-      const label = window.seconds ? duration(window.seconds * 1000) : index === 0 ? "primary" : "secondary";
-      const reset = window.resetAt === undefined ? "" : window.resetAt <= now ? " reset due" : ` ↻${duration(window.resetAt - now)}`;
-      return `${label} ${Math.round(100 - window.used)}% left${reset}`;
-    }).join(" · ");
-    const stale = this.failure || now - snapshot.at >= CACHE_MS || snapshot.windows.some(w => w.resetAt !== undefined && w.resetAt <= now);
-    return `Codex ${windows}${snapshot.blocked ? " · limited" : ""}${stale ? ` · stale${this.failure ? ` (${this.failure})` : ""}` : ""}`;
   }
 
   dispose(): void {

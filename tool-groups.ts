@@ -1,6 +1,7 @@
 import * as Pi from "@earendil-works/pi-coding-agent";
+import { noticeCard, noticePreview, type NoticeContent } from "./notice-cards.ts";
 import { Container, foregroundAnsi, getTerminalColorMode, Markdown, parseColor, stripTerminalSequences, truncateToWidth, visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
-import { safeTitle, type Settings } from "./config.ts";
+import { defaultTranscriptIcons, defaultTranscriptNotices, safeTitle, type Settings, type TranscriptIcons, type FrameOptions } from "./config.ts";
 import { framed, hasContent, isImageLine, subagentFrame } from "./frames.ts";
 const leadingMargin = /^((?:\x1b\[[\d;:]*m|\x1b\]133;[ABC]\x07)*)( {0,2})/;
 const activityGray = { light: parseColor("#595959"), dark: parseColor("#b0b0b0") };
@@ -17,9 +18,8 @@ interface Group { kind: "tools"; rows: ToolRow[] }
 interface Assistant {
   kind: "assistant";
   component: Pi.AssistantMessageComponent;
-  lines: string[];
+  lines: readonly string[];
   first: number;
-  last: number;
   previous: boolean;
   followed?: boolean;
   group?: Group;
@@ -43,7 +43,7 @@ function assistantState(component: Pi.AssistantMessageComponent) {
   };
 }
 
-function snapshot(component: Component, lines: string[]): Component {
+function snapshot(component: Component, lines: readonly string[]): Component {
   return { render: () => lines, invalidate() {}, handleMouse: (event) => component.handleMouse?.(event) };
 }
 
@@ -72,8 +72,45 @@ function answerLines(component: Pi.AssistantMessageComponent, part: "thinking" |
   };
 }
 
+// Reserve the marker column before native wrapping, so continuation lines align.
+const activityWidth = (width: number) => Math.max(1, width - 1);
+
+function activityInfo(component: Component, marker: string, nativeLines?: readonly string[]): Component {
+  let shifts: number[] = [];
+  return {
+    invalidate() { component.invalidate(); },
+    render(width) {
+      let first = true;
+      shifts = [];
+      // Native assistant Markdown has one column of horizontal padding. Replace
+      // that column, rather than adding a second margin in front of it.
+      return (nativeLines ?? component.render(activityWidth(width))).map((line, index) => {
+        if (!line || isImageLine(line)) return line;
+        const [leading = "", escapes = "", margin = ""] = line.match(leadingMargin) ?? [];
+        // Once a printable character is found, a full ANSI strip just to test
+        // emptiness would only duplicate work done by the outer frame.
+        if (!/^[ \t]*[^\s\x00-\x1f\x7f-\x9f]/.test(line.slice(leading.length)) && !stripTerminalSequences(line).trim()) return line;
+        const removed = Math.min(1, margin.length);
+        shifts[index] = 2 - removed;
+        const prefix = first && marker ? `${marker} ` : "  ";
+        first = false;
+        const decorated = prefix + escapes + line.slice(leading.length - margin.length + removed);
+        // The native layout already fit width - 1. Replacing one column with
+        // two cannot overflow; only lines without the expected margin need a check.
+        return removed && width >= 2 ? decorated : truncateToWidth(decorated, width, "");
+      });
+    },
+    handleMouse: (event) => component.handleMouse?.({ ...event, x: event.x - (shifts[event.y] ?? 0), width: activityWidth(event.width) }),
+  };
+}
+
 /** Project the transcript without moving native rows or modifying Pi's messages. */
-export function mountToolGroups(tui: TUI, theme: Pi.Theme, getToolsExpanded: () => boolean, frames?: Settings["frames"]): () => void {
+export function mountToolGroups(
+  tui: TUI, theme: Pi.Theme, getToolsExpanded: () => boolean, frames?: Settings["frames"],
+  icons: TranscriptIcons = defaultTranscriptIcons,
+  skillDescription: (name: string) => string = () => "",
+  notices: Settings["transcriptNotices"] = defaultTranscriptNotices,
+): () => void {
   const chat = findChat(tui);
   const Tool = Pi.ToolExecutionComponent;
   const Message = Pi.AssistantMessageComponent;
@@ -88,16 +125,18 @@ export function mountToolGroups(tui: TUI, theme: Pi.Theme, getToolsExpanded: () 
   let cacheWidth: number | undefined;
   let completedRuns = new WeakMap<RunRow, CachedRun>();
   let completedPrompts = new WeakMap<Pi.UserMessageComponent, { content: Component[]; fragment: Component }>();
+  let noticeCards = new WeakMap<Component, Component>();
   const clearCache = () => {
     completedRuns = new WeakMap();
     completedPrompts = new WeakMap();
+    noticeCards = new WeakMap();
   };
   const invalidate: typeof chat.invalidate = () => {
     // Pi calls chat.invalidate() as part of theme changes (including terminal color reports).
     clearCache();
     nativeInvalidate.call(chat);
   };
-  const overrides = new WeakMap<ToolRow, { revision: number; expanded: boolean }>();
+  const overrides = new WeakMap<Component, { revision: number; expanded: boolean }>();
   const decorated = new WeakMap<ToolRow, { setExpanded: ToolRow["setExpanded"]; local?: boolean }>();
   let globalExpanded = getToolsExpanded();
   let revision = 0;
@@ -110,11 +149,11 @@ export function mountToolGroups(tui: TUI, theme: Pi.Theme, getToolsExpanded: () 
       completedRuns = new WeakMap();
     }
   };
-  const localExpansion = (group: Group) => {
-    const override = overrides.get(group.rows[0]);
+  const localExpansion = (row: Component) => {
+    const override = overrides.get(row);
     return override?.revision === revision ? override.expanded : undefined;
   };
-  const isExpanded = (group: Group) => localExpansion(group) ?? globalExpanded;
+  const isExpanded = (row: Component) => localExpansion(row) ?? globalExpanded;
   const syncRow = (row: ToolRow, local: boolean | undefined) => {
     let state = decorated.get(row);
     if (!state) {
@@ -132,31 +171,47 @@ export function mountToolGroups(tui: TUI, theme: Pi.Theme, getToolsExpanded: () 
       row.setExpanded(local ?? globalExpanded);
     }
   };
-  const toggle = (group: Group) => {
+  const toggle = (group: Group, runKey: RunRow | undefined) => {
     syncGlobal();
-    const expanded = !isExpanded(group);
+    const expanded = !isExpanded(group.rows[0]);
     overrides.set(group.rows[0], { revision, expanded });
-    completedRuns = new WeakMap();
+    if (runKey) completedRuns.delete(runKey);
     for (const row of group.rows) syncRow(row, expanded);
     tui.requestRender();
     return { handled: true };
   };
-  const arrow = (group: Group) => theme.fg("accent", isExpanded(group) ? "▾" : "▸");
+  const glyph = (expanded: boolean) => expanded ? icons.expanded : icons.collapsed;
+  const arrow = (group: Group) => theme.fg("accent", glyph(isExpanded(group.rows[0])));
 
-  const project = (children: readonly Component[], width: number, target: Container, researchHeading = false) => {
+  const addNotice = (row: Component, options: FrameOptions, content: () => NoticeContent) => {
+    let card = noticeCards.get(row);
+    if (!card) {
+      card = noticeCard(options, content(), glyph, () => isExpanded(row), () => {
+        syncGlobal();
+        overrides.set(row, { revision, expanded: !isExpanded(row) });
+        tui.requestRender();
+      });
+      noticeCards.set(row, card);
+    }
+    view.addChild(card);
+  };
+
+  const project = (children: readonly Component[], width: number, target: Container, researchHeading = false, runKey?: RunRow) => {
     target.clear();
     const sections: (Assistant | Group | { kind: "other"; component: Component })[] = [];
     let assistant: Assistant | undefined;
     let group: Group | undefined;
+    // The marker and either arrow occupy the same column. Render once at the
+    // final wrapping width, then choose which marker to use after grouping.
+    const messageWidth = frames ? activityWidth(width) : width;
 
     for (const child of children) {
       if (child instanceof Message) {
-        const lines = child.render(width);
+        const lines = child.render(messageWidth);
         const first = lines.findIndex(hasContent);
         if (first === -1) continue; // Tool-only rounds do not break an existing section.
-        const last = lines.findLastIndex(hasContent);
         if (assistant) assistant.followed = true;
-        assistant = { kind: "assistant", component: child, lines, first, last, previous: assistant !== undefined };
+        assistant = { kind: "assistant", component: child, lines, first, previous: assistant !== undefined };
         sections.push(assistant);
         group = undefined;
       } else if (child instanceof Tool) {
@@ -177,13 +232,22 @@ export function mountToolGroups(tui: TUI, theme: Pi.Theme, getToolsExpanded: () 
     let expandedTools = false;
     for (const section of sections) {
       if (section.kind === "assistant") {
-        const { component, first, last, group } = section;
+        const { group } = section;
+        const inlineGroup = frames && group && !isImageLine(section.lines[section.first]) ? group : undefined;
+        const component = frames
+          ? activityInfo(section.component, inlineGroup ? arrow(inlineGroup) : icons.activity, section.lines)
+          : section.component;
+        const source = frames ? component.render(width) : section.lines;
+        const measured = frames && width < 3 ? source : section.lines;
+        const first = measured === section.lines ? section.first : measured.findIndex(hasContent);
+        const last = measured.findLastIndex(hasContent);
         // Keep existing spacing around normal messages, but pack successive one-line updates.
-        const offset = first === last && section.previous && (group || section.followed) ? first : 0;
-        const lines = section.lines.slice(offset);
-        const titleIndex = last - offset;
+        const offset = first >= 0 && first === last && section.previous && (group || section.followed) ? first : 0;
+        const lines = source.slice(offset);
+        const titleIndex = (frames ? first : last) - offset;
         let shift = 0;
-        if (group) {
+        if (inlineGroup && first >= 0) inline.add(inlineGroup);
+        if (group && !frames) {
           const title = lines[titleIndex];
           const [leading = "", escapes = "", margin = ""] = title.match(leadingMargin) ?? [];
           shift = 2 - margin.length;
@@ -200,16 +264,16 @@ export function mountToolGroups(tui: TUI, theme: Pi.Theme, getToolsExpanded: () 
           handleMouse(event) {
             const onTitle = group && inline.has(group) && event.y === titleIndex;
             if (onTitle && event.x >= 0 && event.x < 2) {
-              if (event.type === "click" && event.button === "left") return toggle(group);
+              if (event.type === "click" && event.button === "left") return toggle(group, runKey);
               return undefined;
             }
-            return component.handleMouse({ ...event, x: event.x - (onTitle ? shift : 0),
-              y: event.y + offset, height: section.lines.length });
+            return component.handleMouse?.({ ...event, x: event.x - (onTitle ? shift : 0),
+              y: event.y + offset, height: source.length });
           },
         });
       } else if (section.kind === "tools") {
         const group = section;
-        const local = localExpansion(group);
+        const local = localExpansion(group.rows[0]);
         for (const row of group.rows) syncRow(row, local);
         if (!inline.has(group)) {
           const heading = researchHeading ? " Agent research" : " AI tools";
@@ -219,10 +283,10 @@ export function mountToolGroups(tui: TUI, theme: Pi.Theme, getToolsExpanded: () 
           target.addChild({
             render: () => [arrow(group) + label],
             invalidate() {},
-            handleMouse: (event) => event.type === "click" && event.button === "left" && event.x < hitWidth ? toggle(group) : undefined,
+            handleMouse: (event) => event.type === "click" && event.button === "left" && event.x >= 0 && event.x < hitWidth ? toggle(group, runKey) : undefined,
           });
         }
-        if (isExpanded(group)) {
+        if (isExpanded(group.rows[0])) {
           expandedTools = true;
           for (const row of group.rows) target.addChild(row);
         }
@@ -249,14 +313,14 @@ export function mountToolGroups(tui: TUI, theme: Pi.Theme, getToolsExpanded: () 
     const work = answer ? run.slice(0, -1) : run;
     const activity = new Container();
     const thinking = answer && assistantState(answer).lastMessage?.content.some((block) => block.type === "thinking")
-      ? answerLines(answer, "thinking") : undefined;
+      ? activityInfo(answerLines(answer, "thinking"), icons.activity) : undefined;
     if (work.length || thinking) {
       let offset = 0;
       let height = 0;
       part.addChild(framed({
         invalidate() {},
         render(width) {
-          expandedTools = project(work, width, activity, options.agentActivity.enabled);
+          expandedTools = project(work, width, activity, options.agentActivity.enabled, run[0]);
           if (thinking) activity.addChild(thinking);
           const lines = activity.render(width);
           height = lines.length;
@@ -344,9 +408,30 @@ export function mountToolGroups(tui: TUI, theme: Pi.Theme, getToolsExpanded: () 
         run = [];
         if (child instanceof User) {
           addPrompt(child, index < lastPrompt, width, frames);
+        } else if (notices.skill.enabled && typeof Pi.SkillInvocationMessageComponent === "function" && child instanceof Pi.SkillInvocationMessageComponent) {
+          // Pi 1.6.0 retains the parsed invocation here; leave unrecognized rows native.
+          const block = (child as unknown as { skillBlock?: Pi.ParsedSkillBlock }).skillBlock;
+          if (typeof block?.name === "string" && typeof block.content === "string") {
+            addNotice(child, notices.skill, () => ({
+              summary: [["Name", block.name], ["Description", skillDescription(block.name) || "—"]],
+              details: [["Instructions", block.content]],
+            }));
+          } else view.addChild(child);
         } else if (child instanceof Custom) {
-          const message = (child as unknown as { message?: { customType?: string; details?: { name?: string; agent?: string } } }).message;
-          if (message?.customType === "subagent_result") {
+          const message = (child as unknown as { message?: { customType?: string; details?: {
+            name?: unknown; agent?: unknown; message?: unknown; sessionFile?: unknown; keepOpen?: unknown;
+          } } }).message;
+          if (message?.customType === "subagent_ping" && notices.help.enabled && typeof message.details?.message === "string") {
+            const { name, agent, message: request, sessionFile, keepOpen } = message.details;
+            addNotice(child, notices.help, () => ({
+              summary: [["Name", typeof name === "string" ? name : "subagent"], ["Role", typeof agent === "string" ? agent : "—"]],
+              preview: ["Preview", noticePreview(request) || "—"],
+              details: [
+                ["Request", request], ...(typeof sessionFile === "string" ? [["Session", sessionFile] as const] : []),
+                ...(keepOpen === true ? [["Follow-up", "The existing pane was kept open."] as const] : []),
+              ],
+            }));
+          } else if (message?.customType === "subagent_result") {
             const { name, agent } = message.details ?? {};
             const sender = safeTitle(`${typeof name === "string" ? name : "subagent"}${typeof agent === "string" ? ` (${agent})` : ""}`);
             view.addChild(subagentFrame(child, frames.subagentMessage, sender));

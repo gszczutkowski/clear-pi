@@ -2,12 +2,17 @@ import { watch, type FSWatcher } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
-import { defaultProgress, type ProgressOptions } from "./config.ts";
+import { defaultProgress, defaultProgressIcons, type ProgressIcons, type ProgressOptions } from "./config.ts";
 import { createProgressReader, type ProgressSnapshot, type ProgressWatch } from "./progress-data.ts";
 import { saveProgressExport } from "./progress-export.ts";
-import { renderProgress, type ProgressView } from "./progress-view.ts";
+import { prepareProgress, renderProgress, type PreparedProgress, type ProgressView } from "./progress-view.ts";
 
 export const PROGRESS_WIDGET = "clear-pi-progress";
+const FULL_REPORT_LIMITS = { maxTasks: 100, maxRuns: 100 };
+const MAX_ON_DEMAND_READS = 3;
+const ACTIONS = ["expand", "full", "compact", "off", "refresh", "export"] as const;
+const actionList = ACTIONS.join("|");
+const summaryHint = "/clear-progress expand — summary · /clear-progress full — full report";
 const empty: ProgressView = { title: null, tasks: [], unassigned: [] };
 
 function branchKey(manager: ExtensionContext["sessionManager"]): string | undefined {
@@ -28,41 +33,51 @@ export function createProgressDashboard(pi: ExtensionAPI, dependencies: Dashboar
   const renderReport = dependencies.render ?? renderProgress;
   let context: ExtensionContext | undefined;
   let options = { ...defaultProgress };
-  let projection: { key: string | undefined; view: ProgressView; exportable: boolean } | undefined;
+  let icons: ProgressIcons = defaultProgressIcons;
+  const reports = new WeakMap<ProgressView, PreparedProgress>();
+  const prepared = (view: ProgressView) => {
+    let report = reports.get(view);
+    if (!report) { report = prepareProgress(view); reports.set(view, report); }
+    return report;
+  };
+  let projection: { key: string | undefined; view: ProgressView; exportable: boolean; generation: number; covered: boolean } | undefined;
   let read: ReturnType<typeof readFactory> | undefined;
   const watchers = new Map<string, { watcher: FSWatcher; names: Set<ProgressWatch["filename"]> }>();
   let pending: ReturnType<typeof setTimeout> | undefined;
-  let inFlight = false;
-  let queued = false;
-  let revision = 0;
+  let inFlight: { manager: ExtensionContext["sessionManager"]; key: string | undefined; generation: number; done: Promise<void> } | undefined;
+  let generation = 0;
+  let lifecycle = 0;
   let mounted = false;
-  let explicit = false;
   let stopped = true;
   let requestRender: (() => void) | undefined;
 
-  const currentView = () => projection && context && projection.key === branchKey(context.sessionManager) ? projection.view : empty;
-  const reportRows = (compact: boolean) => {
-    let cache: { view: ProgressView; width: number; maxTasks: number; maxRuns: number; lines: string[] } | undefined;
+  const currentProjection = () => projection && context && projection.key === branchKey(context.sessionManager) ? projection : undefined;
+  const currentView = () => currentProjection()?.view ?? empty;
+  const reportRows = (mode: "compact" | "expand" | "full") => {
+    let cache: { view: ProgressView; width: number; lines: string[] } | undefined;
     return (width: number) => {
       const view = currentView();
-      const { maxTasks, maxRuns } = options;
-      if (cache?.view === view && cache.width === width && cache.maxTasks === maxTasks && cache.maxRuns === maxRuns) return cache.lines;
-      const lines = renderReport(view, width, { maxTasks, maxRuns, details: !compact, compact });
-      const rows = compact && lines.length ? [...lines, truncateToWidth("/clear-progress expand — full view", width, "")] : lines;
-      cache = { view, width, maxTasks, maxRuns, lines: rows };
-      return cache.lines;
+      if (cache?.view === view && cache.width === width) return cache.lines;
+      const limits = mode === "full" ? FULL_REPORT_LIMITS : options;
+      const lines = renderReport(view, width, { ...limits, details: mode === "full", compact: mode === "compact", icons, prepared: prepared(view) });
+      if (mode === "compact" && lines.length) lines.push(truncateToWidth(summaryHint, width, ""));
+      cache = { view, width, lines };
+      return lines;
     };
   };
-  const clearWatchers = () => {
-    for (const { watcher } of watchers.values()) watcher.close();
-    watchers.clear();
+  const closeWatch = (directory: string) => {
+    const entry = watchers.get(directory);
+    watchers.delete(directory);
+    entry?.watcher.close();
   };
-  const clearPending = () => { if (pending) clearTimeout(pending); pending = undefined; queued = false; };
+  const clearWatchers = () => { for (const directory of watchers.keys()) closeWatch(directory); };
+  const clearPending = () => { if (pending) clearTimeout(pending); pending = undefined; };
   const paint = () => {
     const ctx = context;
     if (!ctx || ctx.mode !== "tui" || typeof ctx.ui.setWidget !== "function") return;
     const view = currentView();
-    const visible = options.enabled && (explicit || view.tasks.length > 0 || view.unassigned.length > 0 || !!view.notice);
+    // Only observed runs produce a summary; explicit expand cannot reveal a Solo panel.
+    const visible = options.enabled && (view.unassigned.length > 0 || view.tasks.some(task => task.runs.length > 0));
     if (!visible) {
       if (mounted) ctx.ui.setWidget(PROGRESS_WIDGET, undefined);
       mounted = false;
@@ -72,7 +87,7 @@ export function createProgressDashboard(pi: ExtensionAPI, dependencies: Dashboar
     ctx.ui.setWidget("subagent-plan", undefined);
     if (mounted) return;
     ctx.ui.setWidget(PROGRESS_WIDGET, (_tui, theme) => {
-      const rows = reportRows(true);
+      const rows = reportRows("compact");
       return { render: (width: number) => rows(width).map(line => theme.fg("muted", line)), invalidate() {} };
     });
     mounted = true;
@@ -81,80 +96,100 @@ export function createProgressDashboard(pi: ExtensionAPI, dependencies: Dashboar
     if (stopped || pending || !options.enabled) return;
     pending = setTimeout(() => {
       pending = undefined;
-      if (inFlight) queued = true;
-      else void refresh();
+      if (!inFlight) void refresh(); // An active read schedules a follow-up if invalidated.
     }, 80);
     pending.unref();
   };
+  const invalidate = () => { generation++; schedule(); };
   const observe = (targets: ProgressWatch[]) => {
     const desired = new Map<string, Set<ProgressWatch["filename"]>>();
+    let covered = targets.length > 0;
     for (const { directory, filename } of targets) {
       if (!desired.has(directory)) {
-        if (desired.size >= 32) continue;
+        if (desired.size >= 32) { covered = false; continue; }
         desired.set(directory, new Set());
       }
       desired.get(directory)!.add(filename);
     }
-    for (const [directory, entry] of watchers) {
-      if (!desired.has(directory)) { entry.watcher.close(); watchers.delete(directory); }
+    for (const directory of watchers.keys()) {
+      if (!desired.has(directory)) closeWatch(directory);
     }
+    const filterKey = (filter: ProgressWatch["filename"]) => typeof filter === "string" ? `:${filter}` : filter.toString();
     let added = false;
     for (const [directory, names] of desired) {
       const existing = watchers.get(directory);
-      if (existing) { existing.names = names; continue; }
+      if (existing) {
+        const previous = new Set([...existing.names].map(filterKey));
+        if ([...names].some(name => !previous.has(filterKey(name)))) added = true;
+        existing.names = names;
+        continue;
+      }
       try {
         const watcher = (dependencies.watch ?? watch)(directory, (_event, filename) => {
           const entry = watchers.get(directory);
           if (entry?.watcher !== watcher) return;
           const name = filename?.toString();
           // Some platforms omit filenames. Reconcile conservatively in that case.
-          if (!name) { schedule(); return; }
+          if (!name) { invalidate(); return; }
           for (const filter of entry.names) {
             const matches = typeof filter === "string"
               ? (process.platform === "win32" ? filter.toLowerCase() === name.toLowerCase() : filter === name)
               : filter.test(name);
-            if (matches) { schedule(); break; }
+            if (matches) { invalidate(); break; }
           }
         });
-        watcher.on("error", () => { watcher.close(); if (watchers.get(directory)?.watcher === watcher) watchers.delete(directory); });
+        const lost = () => {
+          if (watchers.get(directory)?.watcher !== watcher) return;
+          watchers.delete(directory);
+          if (projection) projection.covered = false;
+          generation++;
+        };
+        watcher.on("close", lost);
+        watcher.on("error", () => { lost(); watcher.close(); });
         watchers.set(directory, { watcher, names });
         added = true;
-      } catch { /* Missing directories are retried at the next native boundary. */ }
+      } catch { covered = false; }
     }
-    return added;
+    // Catch writes between discovery and installing a new watch or filter.
+    if (added && covered) invalidate();
+    else if (added) schedule();
+    return covered;
   };
-  const refresh = async () => {
-    if (stopped || !context || !options.enabled || !read) { paint(); return; }
+  const refresh = (oneShot = false) => {
+    const reader = read;
+    if (stopped || !context || (!options.enabled && !oneShot) || !reader) { paint(); return Promise.resolve(); }
+    clearPending();
     const manager = context.sessionManager;
     const key = branchKey(manager);
-    const job = ++revision;
-    inFlight = true;
-    const stillActive = () => job === revision && !stopped && options.enabled;
-    const current = () => stillActive() && context?.sessionManager === manager && branchKey(manager) === key;
-    try {
-      const next = await read(manager);
-      if (!current()) return;
-      projection = { key, view: next.view, exportable: !!key };
-      // Catch writes in the interval between discovery and installing a new watch.
-      if (observe(next.watches)) schedule();
-    } catch {
-      if (!current()) return;
-      projection = { key, view: { ...empty, notice: "Progress data unavailable; no completion inferred." }, exportable: false };
-      clearWatchers();
-    } finally {
-      if (job === revision) {
-        inFlight = false;
-        if (stillActive()) {
-          if (current()) { paint(); requestRender?.(); }
-          if (queued || !current()) { queued = false; schedule(); }
+    const job = { manager, key, generation, done: Promise.resolve() };
+    inFlight = job;
+    const current = () => inFlight === job && context?.sessionManager === manager && branchKey(manager) === key;
+    job.done = (async () => {
+      try {
+        const next = await reader(manager);
+        if (!current()) return;
+        const covered = options.enabled && observe(next.watches);
+        projection = { key, view: next.view, exportable: !!key, generation: job.generation, covered };
+      } catch {
+        if (!current()) return;
+        projection = { key, view: { ...empty, notice: "Progress data unavailable; no completion inferred.", incomplete: true },
+          exportable: false, generation: job.generation, covered: false };
+        clearWatchers();
+      } finally {
+        if (inFlight === job) {
+          const active = current();
+          inFlight = undefined;
+          if (active) { paint(); requestRender?.(); }
+          if (!active || generation !== job.generation) schedule();
         }
       }
-    }
+    })();
+    return job.done;
   };
   const stop = () => {
     stopped = true;
-    ++revision;
-    inFlight = false;
+    lifecycle++;
+    inFlight = undefined;
     clearPending();
     clearWatchers();
     if (mounted) context?.ui.setWidget(PROGRESS_WIDGET, undefined);
@@ -165,15 +200,16 @@ export function createProgressDashboard(pi: ExtensionAPI, dependencies: Dashboar
     projection = undefined;
   };
   const command: Parameters<ExtensionAPI["registerCommand"]>[1] = {
-    description: "Show/export plan and nested agent progress without model calls: expand|compact|off|refresh|export",
-    getArgumentCompletions: prefix => ["expand", "compact", "off", "refresh", "export"]
+    description: `Show/export plan and agent progress without model calls: ${actionList}`,
+    getArgumentCompletions: prefix => ACTIONS
       .filter(value => value.startsWith(prefix)).map(value => ({ value, label: value })),
     handler: async (args, ctx) => {
       if (ctx.mode !== "tui") { if (ctx.hasUI) ctx.ui.notify("Progress dashboard: TUI only", "info"); return; }
       if (stopped || !context) return;
-      const action = args.trim();
-      if (action && !["expand", "compact", "off", "refresh", "export"].includes(action)) {
-        ctx.ui.notify("Usage: /clear-progress [expand|compact|off|refresh|export]", "warning"); return;
+      const arg = args.trim();
+      const action = arg ? ACTIONS.find(candidate => candidate === arg) : "expand";
+      if (!action) {
+        ctx.ui.notify(`Usage: /clear-progress [${actionList}]`, "warning"); return;
       }
       if (action === "export") {
         const manager = ctx.sessionManager;
@@ -186,7 +222,8 @@ export function createProgressDashboard(pi: ExtensionAPI, dependencies: Dashboar
           if (!key || !projection?.exportable || projection.key !== key || !current()) { stale(); return; }
           const directory = join(manager.getSessionDir(), "artifacts", id, "clear-progress");
           // Export only the already projected snapshot, without reading history again.
-          const file = await saveProgressExport(projection.view, directory, options, current);
+          const { view } = projection;
+          const file = await saveProgressExport(view, directory, { ...options, prepared: prepared(view) }, current);
           if (file && current()) ctx.ui.notify(`Progress exported: ${file}`, "info");
           else if (!file && !stopped && context?.sessionManager === manager) stale();
         } catch {
@@ -195,23 +232,50 @@ export function createProgressDashboard(pi: ExtensionAPI, dependencies: Dashboar
         return;
       }
       context = ctx;
-      explicit = true;
-      options.enabled = action !== "off";
-      clearPending();
-      if (!options.enabled) {
-        ++revision;
-        inFlight = false;
+      if (action === "off") {
+        options.enabled = false;
+        clearPending();
+        lifecycle++;
+        inFlight = undefined;
         clearWatchers();
         paint();
         requestRender?.();
         return;
       }
-      read ??= readFactory();
-      await refresh();
-      if (stopped || !options.enabled || context?.sessionManager !== ctx.sessionManager) return;
-      if ((!action || action === "expand") && typeof ctx.ui.custom === "function") {
+      if (action === "compact" || action === "refresh") {
+        options.enabled = true;
+        read ??= readFactory();
+        await refresh();
+        return;
+      }
+      if (typeof ctx.ui.custom === "function") {
+        const manager = ctx.sessionManager;
+        const key = branchKey(manager);
+        const started = lifecycle;
+        const current = () => lifecycle === started && context?.sessionManager === manager && branchKey(manager) === key;
+        let snapshot = currentProjection();
+        // A same-leaf projection is reusable only while its watch coverage is intact and clean.
+        if (!options.enabled || !snapshot?.covered || snapshot.generation !== generation) {
+          const previous = snapshot;
+          // Without full coverage, a read already underway may have missed an unobserved write.
+          const earlier = options.enabled && snapshot?.covered ? undefined : inFlight;
+          for (let attempt = 0; attempt < MAX_ON_DEMAND_READS; attempt++) {
+            read ??= readFactory();
+            const job = inFlight;
+            if (job && job !== earlier && job.manager === manager && job.key === key && job.generation === generation) await job.done;
+            else await refresh(!options.enabled);
+            if (!current()) return;
+            snapshot = currentProjection();
+            if (snapshot && snapshot !== previous && snapshot.generation === generation) break;
+          }
+          if (!snapshot || snapshot === previous || snapshot.generation !== generation) {
+            ctx.ui.notify("Progress is still changing. Try the command again in a moment.", "info");
+            return;
+          }
+        }
+        if (action === "expand" && prepared(snapshot.view).mode === "Solo") return;
         await ctx.ui.custom<void>((tui, theme, keys, done) => {
-          const rows = reportRows(false);
+          const rows = reportRows(action);
           let top = 0;
           let page = 1;
           let total = 0;
@@ -220,10 +284,10 @@ export function createProgressDashboard(pi: ExtensionAPI, dependencies: Dashboar
             render(width: number) {
               const lines = rows(width);
               total = lines.length;
-              page = Math.max(1, Math.floor(tui.terminal.rows * 0.75) - 2);
+              page = Math.max(0, Math.floor(tui.terminal.rows * 0.7) - 1);
               top = Math.min(top, Math.max(0, total - page));
               return [...lines.slice(top, top + page).map(line => theme.fg("muted", line)),
-                theme.fg("dim", truncateToWidth(`↑↓ PgUp/PgDn Home/End · Esc close · ${top + 1}–${Math.min(top + page, total)}/${total}`, width, ""))];
+                theme.fg("dim", truncateToWidth(`Esc close · ${page && total ? top + 1 : 0}–${Math.min(top + page, total)}/${total} · ↑↓ PgUp/PgDn Home/End`, width, ""))];
             },
             handleInput(data: string) {
               if (keys.matches(data, "tui.select.cancel") || keys.matches(data, "tui.select.confirm")) { done(); return; }
@@ -244,25 +308,24 @@ export function createProgressDashboard(pi: ExtensionAPI, dependencies: Dashboar
               return { handled: true };
             },
           };
-        });
+        }, { overlay: true, overlayOptions: { width: "95%" } });
       }
     },
   };
   pi.registerCommand("clear-progress", command);
-  pi.registerCommand("clear-pi-progress", command);
   return {
-    start(ctx: ExtensionContext, settings: ProgressOptions, render: () => void) {
+    start(ctx: ExtensionContext, settings: ProgressOptions, render: () => void, palette: ProgressIcons = defaultProgressIcons) {
       stop();
       if (ctx.mode !== "tui" || typeof ctx.ui.setWidget !== "function") return;
       context = ctx;
       options = { ...settings };
-      explicit = false;
+      icons = palette;
       requestRender = render;
       stopped = false;
       if (options.enabled) read = readFactory();
       return refresh();
     },
-    update(ctx: ExtensionContext) { if (!stopped) { context = ctx; schedule(); } },
+    update(ctx: ExtensionContext) { if (!stopped) { context = ctx; invalidate(); } },
     stop,
   };
 }

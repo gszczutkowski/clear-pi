@@ -26,7 +26,7 @@ function wrapFrame(child: Component, options: FrameOptions, reserveMargin: boole
   if (!options.enabled) return child;
   let inset = 0;
   let renderedWidth = 0;
-  let body: string[] = [];
+  let body: readonly string[] = [];
   let bordered = false;
   return {
     invalidate: () => child.invalidate(),
@@ -44,8 +44,10 @@ function wrapFrame(child: Component, options: FrameOptions, reserveMargin: boole
       const pad = inset === 2 ? " " : "";
       return [top(options.title, width, color), ...body.map((raw) => {
         if (isImageLine(raw)) return raw; // Don't prepend text to image transport sequences.
-        const line = fits(frameContentLine(raw, foreground), inner);
-        return `${color}│${reset}${pad}${line}${reset}${" ".repeat(inner - visibleWidth(line))}${pad}${color}│${reset}`;
+        let line = frameContentLine(raw, foreground);
+        let columns = visibleWidth(line);
+        if (columns > inner) { line = truncateToWidth(line, inner, ""); columns = visibleWidth(line); }
+        return `${color}│${reset}${pad}${line}${reset}${" ".repeat(inner - columns)}${pad}${color}│${reset}`;
       }), bottom(width, color)];
     },
     handleMouse(event) {

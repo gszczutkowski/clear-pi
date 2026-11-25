@@ -76,8 +76,8 @@ export function quotaText(client: UsageClient | undefined, now: number, barWidth
   icon = defaultFooter.codexQuota.icon): string {
   const snapshot = client?.snapshot;
   if (!snapshot) return `Codex ${client ? client.failure ?? "loading" : "unsupported provider"}`;
-  const windows = snapshot.windows.map((window, index) => {
-    const label = window.seconds ? duration(window.seconds * 1000) : index === 0 ? "primary" : "secondary";
+  const windows = snapshot.windows.map((window) => {
+    const label = window.seconds ? duration(window.seconds * 1000) : window.kind;
     const remaining = 100 - window.used;
     const filled = Math.round(remaining / 100 * barWidth);
     const rawBar = `[${"▰".repeat(filled)}${"▱".repeat(barWidth - filled)}]`;

@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createProgressDashboard, PROGRESS_WIDGET } from "../progress.ts";
 import { defaultProgress, parseSettings } from "../config.ts";
-import { progressIcons, renderProgress, type ProgressView } from "../progress-view.ts";
+import { renderProgress, type ProgressView } from "../progress-view.ts";
 
 function harness() {
   const commands = new Map<string, any>();
@@ -18,6 +18,7 @@ function harness() {
   let directories = ["/scope/history"];
   let view: ProgressView = { title: "Demo", tasks: [{ id: "T1", title: "Feature", status: "pending", runs: [] }], unassigned: [] };
   let broken = false;
+  let unavailableDirectory: string | undefined;
   const hiddenWidgets: string[] = [];
   const watches: { path: string; callback: Function; closed: boolean; emitter: EventEmitter }[] = [];
   const ctx: any = { get mode() { return mode; }, hasUI: true, sessionManager: {
@@ -48,6 +49,7 @@ function harness() {
     },
     render: (...args) => { reports++; return renderProgress(...args); },
     watch: ((path: string, callback: Function) => {
+      if (path === unavailableDirectory) throw new Error("watch unavailable");
       const emitter = new EventEmitter();
       const item = { path, callback, closed: false, emitter };
       watches.push(item);
@@ -59,8 +61,29 @@ function harness() {
     rendered: () => widget?.render(100).join("\n"), reads: () => reads, paints: () => paints, renders: () => renders,
     setView: (next: ProgressView) => { view = next; }, setDirectories: (next: string[]) => { directories = next; },
     setMode: (next: string) => { mode = next; }, fail: () => { broken = true; }, setLeaf: (next: string) => { leaf = next; },
-    reports: () => reports, delayNextRead: () => { const deferred = Promise.withResolvers<void>(); blocker = deferred.promise; return deferred.resolve; } };
+    reports: () => reports, delayNextRead: () => { const deferred = Promise.withResolvers<void>(); blocker = deferred.promise; return deferred.resolve; },
+    loseWatch: (index: number) => {
+      unavailableDirectory = watches[index].path;
+      watches[index].emitter.emit("error", new Error("watch lost"));
+    },
+    captureOverlays: () => {
+      const overlays: string[] = [];
+      ctx.ui.custom = async (factory: any) => {
+        const component = factory({ terminal: { rows: 30 } }, { fg: (_: string, line: string) => line }, {}, () => {});
+        overlays.push(component.render(100).join("\n"));
+      };
+      return overlays;
+    },
+  };
 }
+
+function savedRun(name: string): ProgressView {
+  return { title: null, tasks: [], unassigned: [
+    { id: name, name, role: "worker", task: "Example", status: "SAVED", children: [] },
+  ] };
+}
+
+const eventFilename = `${"a".repeat(64)}.json`;
 
 test("export saves the cached detailed report without reads, UI changes or re-enabling watchers", async () => {
   const root = await mkdtemp(join(tmpdir(), "clear-progress-command-"));
@@ -70,6 +93,8 @@ test("export saves the cached detailed report without reads, UI changes or re-en
   h.ctx.ui.notify = (message: string) => notices.push(message);
   try {
     await h.start();
+    h.setView(savedRun("Not yet projected"));
+    h.watches[0].callback("change", eventFilename);
     await h.command("off");
     const reads = h.reads(), paints = h.paints(), watches = h.watches.length;
     await h.command("export");
@@ -81,7 +106,9 @@ test("export saves the cached detailed report without reads, UI changes or re-en
     const directory = join(root, "artifacts", "session-test", "clear-progress");
     const names = await readdir(directory);
     assert.equal(names.length, 1);
-    assert.match(await readFile(join(directory, names[0]), "utf8"), /Main Agent/);
+    const html = await readFile(join(directory, names[0]), "utf8");
+    assert.match(html, /Main Agent/);
+    assert.doesNotMatch(html, /Not yet projected/);
     assert.match(notices[0], /^Progress exported:/);
     assert.deepEqual(h.commands.get("clear-progress").getArgumentCompletions("ex").map((item: any) => item.value), ["expand", "export"]);
     h.ctx.sessionManager.getHeader = () => ({ id: "../bad" });
@@ -94,7 +121,7 @@ test("export saves the cached detailed report without reads, UI changes or re-en
 test("progress settings are independent, bounded and default-enabled", () => {
   assert.deepEqual(parseSettings(undefined).progress, defaultProgress);
   assert.deepEqual(parseSettings({ progress: { enabled: false, details: false, maxTasks: 5, maxRuns: 90 } }).progress,
-    { enabled: false, details: false, maxTasks: 5, maxRuns: 90 });
+    { enabled: false, maxTasks: 5, maxRuns: 90 });
   assert.deepEqual(parseSettings({ progress: { enabled: "false", details: null, maxTasks: 0, maxRuns: 101 } }).progress, defaultProgress);
 });
 
@@ -104,17 +131,13 @@ test("controller has no startup side effects and uses display-only commands", as
   assert.equal(h.watches.length, 0);
   await h.start();
   assert.equal(h.reads(), 1);
-  assert.match(h.rendered(), /Main Agent/);
+  assert.equal(h.rendered(), undefined);
   const initialPaints = h.paints();
   h.setView({ title: "Updated", tasks: [{ id: "T1", title: "Feature", status: "accepted", runs: [] }], unassigned: [] });
   await h.command("compact");
-  assert.match(h.rendered(), /Updated/);
-  assert.match(h.rendered(), /Stages:/);
-  assert.ok(h.rendered().includes(`${progressIcons.checked} T1 Feature`));
-  assert.doesNotMatch(h.rendered(), /Runs:|Notice:|╭─ Task/);
-  assert.match(h.rendered(), /╰[^\n]+╯\n\/clear-progress expand — full view$/);
-  assert.deepEqual(h.hiddenWidgets, ["subagent-plan", "subagent-plan"]);
-  assert.equal(h.commands.get("clear-progress"), h.commands.get("clear-pi-progress"));
+  assert.equal(h.rendered(), undefined);
+  assert.deepEqual(h.hiddenWidgets, []);
+  assert.deepEqual([...h.commands.keys()], ["clear-progress"]);
   assert.equal(h.paints(), initialPaints); // No component churn on refresh.
   assert.ok(h.renders() >= 2);
   await h.command("off");
@@ -124,13 +147,13 @@ test("controller has no startup side effects and uses display-only commands", as
   h.dashboard.update(h.ctx);
   assert.equal(h.reads(), reads);
   await h.command("expand");
-  assert.match(h.rendered(), /Main Agent/);
+  assert.equal(h.rendered(), undefined);
   h.dashboard.stop();
   assert.equal(h.rendered(), undefined);
   assert.ok(h.watches.every(w => w.closed));
 });
 
-test("widget separates delegated work and updated runtime metadata from the parent stage", async () => {
+test("widget summarizes top-level assignments without nested runtime cards", async () => {
   const h = harness();
   try {
     await h.start();
@@ -142,9 +165,148 @@ test("widget separates delegated work and updated runtime metadata from the pare
     ] }], unassigned: [] });
     await h.command("refresh");
     const rows = h.rendered().split("\n").slice(1, -2).map((line: string) => line.slice(2, -2).trimEnd());
-    assert.deepEqual(rows, ["Plan: Demo", "Stages:", `${progressIcons.unchecked} T1 Feature (in_review)`,
-      `   ${progressIcons.checked} Implement Feature`, "      worker: test-model | high",
-      `   ${progressIcons.checked} Review Feature`, "      reviewer: test-model | xhigh"]);
+    assert.match(h.rendered(), /Main Agent ─+ 󰄬 2\/2 · 󱙺 2/);
+    assert.equal(rows[0].trim(), "");
+    assert.equal(rows.length, 5);
+    assert.match(rows[1], /Implement Feature · completed · T1: in_review/);
+    assert.match(rows[3], /Review Feature · completed · T1: in_review/);
+    assert.match(rows[2], /\u{F17A9} 󰢻  test-model ·  high/u);
+    assert.match(rows[4], /\u{F17A9} 󰛐  test-model ·  xhigh/u);
+  } finally { h.dashboard.stop(); }
+});
+
+test("Solo stays unmounted until observed runs arrive, and removes the panel when they disappear", async () => {
+  const h = harness();
+  try {
+    await h.start();
+    await h.command("expand");
+    assert.equal(h.rendered(), undefined);
+    assert.deepEqual(h.hiddenWidgets, []);
+    assert.ok(h.watches.some(watch => !watch.closed));
+    h.setView({ title: "Delegated", tasks: [], unassigned: [{ id: "run", name: "Implement", role: "worker",
+      task: "Saved task", status: "SAVED", children: [] }] });
+    h.watches[0].callback("change", null);
+    await new Promise(resolve => setTimeout(resolve, 120));
+    assert.match(h.rendered(), /Main Agent ─+ 󰄬/);
+    assert.match(h.rendered(), /󰋼 Implement · saved/);
+    assert.match(h.rendered(), /clear-progress expand/);
+    h.setView({ title: "Solo again", tasks: [], unassigned: [] });
+    await h.command("refresh");
+    assert.equal(h.rendered(), undefined);
+    const suppressions = h.hiddenWidgets.length;
+    await h.command("expand");
+    assert.equal(h.hiddenWidgets.length, suppressions);
+  } finally { h.dashboard.stop(); }
+});
+
+test("expand waits for same-leaf evidence after a matching file event, without waiting for debounce", async () => {
+  const h = harness();
+  const overlays = h.captureOverlays();
+  try {
+    await h.start();
+    await h.command("refresh"); // Settle initial watch installation.
+    await h.command("expand");
+    assert.deepEqual(overlays, []);
+    const reads = h.reads();
+    h.setView(savedRun("Newly delegated"));
+    h.watches[0].callback("rename", eventFilename);
+    assert.equal(h.reads(), reads);
+    await h.command("expand");
+    assert.match(overlays[0] ?? "", /Newly delegated/);
+    assert.equal(h.reads(), reads + 1);
+  } finally { h.dashboard.stop(); }
+});
+
+test("full shares a current in-flight read but waits again if a newer file event arrives", async () => {
+  const h = harness();
+  const overlays = h.captureOverlays();
+  try {
+    h.setView(savedRun("Before event"));
+    await h.start();
+    await h.command("refresh");
+    const reads = h.reads();
+    h.watches[0].callback("change", eventFilename);
+    const release = h.delayNextRead();
+    const pending = h.command("refresh");
+    const report = h.command("full");
+    assert.deepEqual(overlays, []);
+    assert.equal(h.reads(), reads + 1);
+    h.setView(savedRun("After event"));
+    h.watches[0].callback("change", eventFilename);
+    release();
+    await Promise.all([pending, report]);
+    assert.equal(overlays.length, 1);
+    assert.match(overlays[0], /After event/);
+    assert.doesNotMatch(overlays[0], /Before event/);
+    assert.equal(h.reads(), reads + 2);
+  } finally { h.dashboard.stop(); }
+});
+
+test("manual reports yield with a notice when changes repeatedly race every read", { timeout: 2_000 }, async () => {
+  const h = harness();
+  const overlays = h.captureOverlays();
+  const notices: string[] = [];
+  h.ctx.ui.notify = (message: string) => notices.push(message);
+  try {
+    await h.start();
+    await h.command("refresh");
+    const reads = h.reads();
+    h.watches[0].callback("change", eventFilename);
+    let release = h.delayNextRead();
+    const report = h.command("full");
+    for (let i = 0; i < 3; i++) {
+      assert.equal(h.reads(), reads + i + 1);
+      h.watches[0].callback("change", eventFilename);
+      const nextRelease = h.delayNextRead();
+      release();
+      release = nextRelease;
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+    await report;
+    assert.deepEqual(overlays, []);
+    assert.match(notices.join("\n"), /still changing/);
+  } finally { h.dashboard.stop(); }
+});
+
+for (const reason of ["lost watcher", "watch limit"]) test(`manual reports re-read same-leaf evidence without full coverage (${reason})`, async () => {
+  const h = harness();
+  const overlays = h.captureOverlays();
+  const lost = reason === "lost watcher";
+  if (!lost) h.setDirectories(Array.from({ length: 33 }, (_, i) => `/scope/history-${i}`));
+  try {
+    await h.start();
+    await h.command("refresh");
+    if (lost) h.loseWatch(0);
+    const reads = h.reads();
+    h.setView(savedRun("First unseen update"));
+    await h.command("expand");
+    assert.match(overlays[0] ?? "", /First unseen update/);
+    h.setView(savedRun("Second unseen update"));
+    await h.command("full");
+    assert.match(overlays[1] ?? "", /Second unseen update/);
+    assert.doesNotMatch(overlays[1], /First unseen update/);
+    assert.equal(h.reads(), reads + 2);
+    assert.equal(h.watches.filter(watch => !watch.closed).length, lost ? 0 : 32);
+  } finally { h.dashboard.stop(); }
+});
+
+test("full does not reuse a read started before the request when a watch is unavailable", async () => {
+  const h = harness();
+  const overlays = h.captureOverlays();
+  try {
+    h.setView(savedRun("Before loss"));
+    await h.start();
+    await h.command("refresh");
+    h.loseWatch(0);
+    const release = h.delayNextRead();
+    const pending = h.command("refresh");
+    h.setView(savedRun("After loss"));
+    const report = h.command("full");
+    release();
+    await Promise.all([pending, report]);
+    assert.equal(overlays.length, 1);
+    assert.match(overlays[0], /After loss/);
+    assert.doesNotMatch(overlays[0], /Before loss/);
   } finally { h.dashboard.stop(); }
 });
 
@@ -188,19 +350,17 @@ test("non-TUI and empty sessions remain untouched; manual view can show empty st
   h.setMode("tui"); h.setView({ title: null, tasks: [], unassigned: [] }); await h.start();
   assert.equal(h.rendered(), undefined);
   await h.command("");
-  assert.match(h.rendered(), /No active plan/);
-  assert.doesNotMatch(h.rendered(), /No tasks|Stages:|Operations/);
+  assert.equal(h.rendered(), undefined);
   h.dashboard.stop();
 });
 
 test("tall plans have a bounded preview and a keyboard/mouse scrollable full view", async () => {
   const h = harness();
-  h.setView({ title: "Long plan", tasks: Array.from({ length: 12 }, (_, i) => ({
+  h.setView({ title: "Long plan", tasks: Array.from({ length: 101 }, (_, i) => ({
     id: `T${i + 1}`, title: `Feature ${i + 1}`, status: "pending", runs: [],
   })), unassigned: [] });
   await h.start();
-  assert.ok(h.rendered().split("\n").length <= 11);
-  assert.match(h.rendered(), /│ … more in full view +│/);
+  assert.equal(h.rendered(), undefined);
   let closed = false;
   h.ctx.ui.custom = async (factory: any) => {
     const component = factory({ terminal: { rows: 20 }, requestRender() {} },
@@ -212,7 +372,9 @@ test("tall plans have a bounded preview and a keyboard/mouse scrollable full vie
     assert.ok(first.split("\n").length <= 14);
     component.handleInput("\x1b[F"); // End
     const last = component.render(80).join("\n");
-    assert.match(last, /Task T12/);
+    assert.match(last, /Task T100: Feature 100/);
+    assert.doesNotMatch(last, /Task T101: Feature 101/);
+    assert.match(last, /1 tasks hidden \(maxTasks\)/);
     assert.notEqual(last, first);
     component.handleInput("\x1b[H"); // Home
     assert.equal(component.render(80).join("\n"), first);
@@ -235,16 +397,72 @@ test("tall plans have a bounded preview and a keyboard/mouse scrollable full vie
     component.handleInput("tui.select.cancel");
   };
   await h.command("expand");
+  assert.equal(h.rendered(), undefined);
+  assert.equal(closed, false);
+  await h.command("compact");
+  assert.equal(h.rendered(), undefined);
+  await h.command("full");
   assert.ok(closed);
   h.dashboard.stop();
+});
+
+test("full view shows up to 100 run cards without raising the expanded summary limit", async () => {
+  const h = harness();
+  h.setView({ title: null, tasks: [], unassigned: Array.from({ length: 101 }, (_, i) => ({
+    id: `run-${i + 1}`, name: `Run ${i + 1}`, role: "worker", task: "Saved task", status: "SAVED", children: [],
+  })) });
+  try {
+    await h.start();
+    await h.command("refresh"); // Reconcile after watch installation before checking cache reuse.
+    const compact = h.rendered();
+    const reads = h.reads();
+    let last = "";
+    h.ctx.ui.custom = async (factory: any, options: { overlay: boolean }) => {
+      assert.equal(options.overlay, true);
+      const component = factory({ terminal: { rows: 24 }, requestRender() {} },
+        { fg: (_: string, line: string) => line }, { matches: () => false }, () => {});
+      assert.ok(component.render(80).length <= 16);
+      component.handleInput("\x1b[F"); // End
+      last = component.render(80).join("\n");
+      assert.match(last, /Esc close/);
+    };
+    await h.command("expand");
+    assert.match(last, /Run 20 · saved/);
+    assert.doesNotMatch(last, /Run 21 · saved/);
+    assert.equal(h.rendered(), compact);
+    await h.command("full");
+    assert.match(last, /worker: Run 100\b/);
+    assert.doesNotMatch(last, /worker: Run 101\b/);
+    assert.match(last, /runs hidden \(display limits\)/);
+    assert.equal(h.rendered(), compact);
+    assert.equal(h.reads(), reads);
+  } finally { h.dashboard.stop(); }
+});
+
+test("while off, each on-demand report sees updated evidence without restarting watches", async () => {
+  const h = harness();
+  const overlays = h.captureOverlays();
+  try {
+    await h.start();
+    await h.command("off");
+    const reads = h.reads();
+    h.setView(savedRun("Previous"));
+    await h.command("full");
+    assert.match(overlays[0], /Previous/);
+    h.setView(savedRun("Current"));
+    await h.command("expand");
+    assert.match(overlays[1], /Current/);
+    assert.doesNotMatch(overlays[1], /Previous/);
+    assert.equal(h.reads(), reads + 2);
+    assert.ok(h.watches.every(watch => watch.closed));
+    assert.equal(h.rendered(), undefined);
+  } finally { h.dashboard.stop(); }
 });
 
 test("unavailable data clears old accepted state and sanitizes observer failures", async () => {
   const h = harness(); await h.start(); h.fail();
   await h.command("refresh");
-  assert.match(h.rendered(), /No active plan/);
-  assert.doesNotMatch(h.rendered(), /sensitive raw error|Notice:/);
-  assert.ok(!h.rendered().includes(progressIcons.checked));
+  assert.equal(h.rendered(), undefined);
   assert.ok(h.watches.every(w => w.closed));
   h.dashboard.stop();
 });
@@ -289,7 +507,7 @@ test("watch events are filtered by exact filenames, with a fallback for missing 
     callback("rename", "unrelated.txt");
     await new Promise(resolve => setTimeout(resolve, 120));
     assert.equal(h.reads(), count);
-    callback("change", `${"a".repeat(64)}.json`);
+    callback("change", eventFilename);
     callback("change", null);
     await new Promise(resolve => setTimeout(resolve, 120));
     assert.equal(h.reads(), count + 1);
@@ -308,14 +526,18 @@ test("in-flight snapshots neither repaint another branch nor remount an off pane
     h.setLeaf("branch-b");
     h.setView({ title: "Branch B", tasks: [], unassigned: [] });
     stale(); await a;
-    assert.doesNotMatch(h.rendered(), /Demo/);
+    assert.equal(h.rendered(), undefined);
     await h.command("refresh");
-    assert.match(h.rendered(), /Branch B/);
+    assert.equal(h.rendered(), undefined);
+    const overlays = h.captureOverlays();
+    h.setView(savedRun("Late run"));
+    h.watches[0].callback("change", eventFilename);
     const late = h.delayNextRead();
-    const b = h.command("refresh");
+    const b = h.command("full");
     await h.command("off");
     const count = h.renders();
     late(); await b;
+    assert.deepEqual(overlays, []);
     assert.equal(h.renders(), count);
     assert.equal(h.rendered(), undefined);
     assert.ok(h.watches.every(w => w.closed));

@@ -10,7 +10,8 @@ import {
   SessionManager, SettingsManager, type CreateAgentSessionServicesOptions, type ProviderConfig,
 } from "@earendil-works/pi-coding-agent";
 import { Container, stripTerminalSequences, Text, visibleWidth, type Terminal } from "@earendil-works/pi-tui";
-import { parseSettings } from "../config.ts";
+import { defaultProgress, parseSettings } from "../config.ts";
+import { createProgressDashboard } from "../progress.ts";
 import { mountToolGroups } from "../tool-groups.ts";
 
 const piEntry = import.meta.resolve("@earendil-works/pi-coding-agent");
@@ -35,9 +36,9 @@ test("installed Pi 1.6.0: streaming, fullscreen mouse, tree rebuild, regular mod
   writeFileSync(join(cwd, "fixture.txt"), "Real read result from fixture\n");
 
   let input!: (data: string) => void;
-  let writes = "";
+  let writes = "", columns = 100, rows = 60;
   const terminal: Terminal = {
-    columns: 100, rows: 60, kittyProtocolActive: false,
+    get columns() { return columns; }, get rows() { return rows; }, kittyProtocolActive: false,
     start(callback) { input = callback; }, stop() {}, async drainInput() {},
     write(data) { writes += data; }, moveBy() {}, hideCursor() {}, showCursor() {},
     clearLine() {}, clearFromCursor() {}, clearScreen() {}, setTitle() {}, setProgress() {}, setProgramStatus() {},
@@ -89,8 +90,19 @@ test("installed Pi 1.6.0: streaming, fullscreen mouse, tree rebuild, regular mod
     noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true,
     extensionFactories: [(pi) => {
       pi.registerProvider(provider, { api, baseUrl: model.baseUrl, apiKey: "unused", models: [model], streamSimple });
+      const dashboard = createProgressDashboard(pi, { createReader: () => async () => ({ watches: [], view: {
+        title: null, tasks: [], unassigned: Array.from({ length: 20 }, (_, i) => ({
+          id: `run-${i}`, name: `Operation ${i + 1}`, role: "worker", task: "Saved task", status: "SAVED", children: [],
+        })),
+      } }) });
+      let renderProgress = () => {};
+      pi.registerCommand("fixture-progress", { description: "Mount a synthetic dashboard", handler: async (_args, ctx) => {
+        await dashboard.start(ctx, defaultProgress, renderProgress);
+      } });
+      pi.on("session_shutdown", () => dashboard.stop());
       pi.on("session_start", (_event, ctx) => {
         ctx.ui.setFooter((tui, theme) => {
+          renderProgress = () => tui.requestRender();
           const document = tui.children[0] as Container;
           const chat = document.children[2] as Container;
           const native = [chat.render, chat.handleMouse, chat.invalidate];
@@ -111,7 +123,7 @@ test("installed Pi 1.6.0: streaming, fullscreen mouse, tree rebuild, regular mod
             }
             tui.requestRender();
           };
-          return { render: () => [], invalidate() {}, dispose: unmount };
+          return { render: () => ["Fixture footer"], invalidate() {}, dispose: unmount };
         });
       });
       pi.registerCommand("fixture-tree", { description: "Navigate fixture tree without a summary", handler: async (id, ctx) => {
@@ -121,6 +133,10 @@ test("installed Pi 1.6.0: streaming, fullscreen mouse, tree rebuild, regular mod
     }],
   };
   const manager = SessionManager.inMemory(cwd);
+  manager.appendMessage({ role: "user", content: '<skill name="fixture-skill" location="/skill/SKILL.md">\nFixture skill instructions\n</skill>', timestamp: Date.now() });
+  manager.appendCustomMessageEntry("subagent_ping", "Fixture native help", true, {
+    name: "Fixture worker", agent: "worker", message: "Help preview\nFull request from fixture", sessionFile: "/sessions/fixture.jsonl",
+  });
   manager.appendMessage({ role: "user", content: "Shared prompt", timestamp: Date.now() });
   const shared = manager.appendMessage(message("Shared answer"));
   manager.appendMessage({ role: "user", content: "Alternate branch prompt", timestamp: Date.now() });
@@ -149,7 +165,18 @@ test("installed Pi 1.6.0: streaming, fullscreen mouse, tree rebuild, regular mod
     assert.match(writes, /\x1b\[\?1049h/);
     assert.equal(typeof exerciseFallback, "function", stripTerminalSequences(writes));
     assert.match(text(), /User prompt[\s\S]*Shared prompt[\s\S]*Agent answer[\s\S]*Shared answer/);
-    assert.doesNotMatch(text(), /Alternate branch/);
+    assert.match(text(), /▸ Skill invoked[\s\S]*▸ Needs help[\s\S]*Help preview/);
+    assert.doesNotMatch(text(), /Alternate branch|Fixture skill instructions|Full request from fixture/);
+    const helpY = screen().findIndex(line => line.includes("▸ Needs help"));
+    input(`\x1b[<0;4;${helpY + 1}M`);
+    input(`\x1b[<0;4;${helpY + 1}m`);
+    assert.match(text(), /▸ Skill invoked[\s\S]*▾ Needs help[\s\S]*Full request from fixture[\s\S]*fixture\.jsonl/);
+    assert.doesNotMatch(text(), /Fixture skill instructions/);
+    input("\x0f");
+    assert.match(text(), /▾ Skill invoked[\s\S]*Fixture skill instructions/);
+    input("\x0f");
+    assert.match(text(), /▸ Skill invoked[\s\S]*▸ Needs help/);
+    assert.doesNotMatch(text(), /Fixture skill instructions|Full request from fixture/);
     main = runtime.session.prompt("Main branch prompt");
     for (let retry = 0; retry < 100 && !text().includes("Streaming progress"); retry++) await delay(10);
     assert.match(text(), /Streaming progress/);
@@ -188,6 +215,25 @@ test("installed Pi 1.6.0: streaming, fullscreen mouse, tree rebuild, regular mod
     });
     input("\x0f"); // The real Ctrl+O binding still expands the native read card.
     assert.match(text(), /read fixture\.txt[\s\S]*Real read result from fixture/);
+
+    columns = 80; rows = 24;
+    await runtime.session.prompt("/fixture-progress");
+    assert.match(text(), /clear-progress expand/);
+    assert.match(text(), /Fixture footer/);
+    const expanded = runtime.session.prompt("/clear-progress expand");
+    try {
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.match(text(), /Esc close/);
+      assert.match(text(), /Fixture footer/);
+      input("\x1b[F"); // End in the actual overlay, not a mock component.
+      assert.match(text(), /Operation 20 · saved/);
+    } finally {
+      input("\r");
+      await expanded;
+    }
+    assert.match(text(), /clear-progress expand/);
+    assert.match(text(), /Fixture footer/);
+    assert.equal(requests, 3);
   } finally {
     finishFirstResponse();
     await main?.catch(() => {});

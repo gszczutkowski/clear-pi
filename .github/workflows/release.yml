@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+# Every event retains its own immutable source commit. Do not use a concurrency
+# group: GitHub can replace pending runs, silently skipping a merged PR.
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm run check:version
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run check:package
+      - name: Build package and tag the exact merged commit
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(node -p 'JSON.parse(require("fs").readFileSync("package.json")).version')
+          tag="v$version"
+          npm pack --pack-destination "$RUNNER_TEMP"
+          # A rerun may reuse this tag, but never move it to different source.
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" > /dev/null; then
+            git fetch origin "refs/tags/$tag:refs/tags/$tag"
+            if [ "$(git rev-parse "$tag^{commit}")" != "$GITHUB_SHA" ]; then
+              echo "Version $version already belongs to a different commit. Bump the PR version." >&2
+              exit 1
+            fi
+          else
+            git tag "$tag" "$GITHUB_SHA"
+            git push origin "refs/tags/$tag"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "package=$RUNNER_TEMP/clear-pi-$version.tgz" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.version.outputs.tag }}
+          path: ${{ steps.version.outputs.package }}
+          if-no-files-found: error
+          overwrite: true
+      - name: Publish GitHub Release (safe to rerun)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          PACKAGE: ${{ steps.version.outputs.package }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" "$PACKAGE" --clobber
+          else
+            gh release create "$TAG" "$PACKAGE" --verify-tag --title "$TAG" --generate-notes
+          fi

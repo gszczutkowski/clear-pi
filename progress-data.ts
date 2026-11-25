@@ -17,6 +17,8 @@ const MAX_FILE = 2 * 1024 * 1024;
 const MAX_EVENTS = 2000;
 const MAX_ENTRIES = 10000;
 const MAX_RUNS = 2000;
+const MAX_PREVIEW = 320;
+const MAX_NATIVE_RESULT = 4096;
 const object = (v: any): v is RecordData => !!v && typeof v === "object" && !Array.isArray(v);
 const string = (v: any): v is string => typeof v === "string" && v.length > 0 && v.length <= 8192;
 const missing = (error: unknown) => ["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException)?.code ?? "");
@@ -73,16 +75,24 @@ function isLineage(v: any): v is Lineage {
   return object(v) && v.version === 1 && [v.parent, v.root, v.child].every(i => object(i) && string(i.sessionId) && string(i.sessionFile) && isAbsolute(i.sessionFile))
     && [v.rootAssignmentId, v.rootCheckpoint, v.rootBranchToken, v.eventDirectory].every(string) && isAbsolute(v.eventDirectory);
 }
-function text(value: unknown, max = 320): string | undefined {
+function sanitizedText(value: unknown, multiline = false): string | undefined {
   if (typeof value !== "string") return undefined;
   // Strip control strings as a unit, including OSC 8's invisible target.
   // Discard unterminated control strings to the end rather than exposing their payload.
-  return value.replace(/(?:\x1b\]|\x9d)(?:[^\x07\x1b\x9c]|\x1b(?!\\))*(?:\x07|\x1b\\|\x9c|$)/g, "")
+  const sanitized = value.replace(/(?:\x1b\]|\x9d)(?:[^\x07\x1b\x9c]|\x1b(?!\\))*(?:\x07|\x1b\\|\x9c|$)/g, "")
     .replace(/(?:\x1b[P^_X]|[\x90\x98\x9e\x9f])[\s\S]*?(?:\x1b\\|\x9c|$)/g, "")
-    .replace(/(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]|\x1b[ -/]*[0-~]/g, "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ")
+    .replace(/(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]|\x1b[ -/]*[0-~]/g, "").replace(/\r\n?/g, "\n")
+    .replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f\u2028-\u202e\u2066-\u2069]/g, " ")
     .replace(/\b(Bearer\s+)[^\s]+/gi, "$1[redacted]")
-    .replace(/\b(api[_-]?key|token|password|secret)\s*[:=]\s*[^\s,;]+/gi, "$1=[redacted]")
-    .replace(/\s+/g, " ").trim().slice(0, max) || undefined;
+    .replace(/\b(api[_-]?key|token|password|secret)\s*[:=]\s*[^\s,;]+/gi, "$1=[redacted]");
+  return sanitized.replace(multiline ? /[^\S\n]+/g : /\s+/g, " ").trim() || undefined;
+}
+function text(value: unknown, max = MAX_PREVIEW): string | undefined {
+  return sanitizedText(value)?.slice(0, max).toWellFormed();
+}
+function excerpt(value: string | undefined, max: number): string | undefined {
+  if (value === undefined) return undefined;
+  return value.length > max ? `${value.slice(0, max - 1).trimEnd().toWellFormed()}…` : value.toWellFormed();
 }
 
 /** Read-only, same-user snapshot adapter. Saved evidence never establishes liveness or acceptance. */
@@ -100,14 +110,19 @@ async function project(manager: Manager, previous: Map<string, CachedEvent>, nex
     return paths.get(path)!;
   };
   const identity = async (i: Identity) => JSON.stringify([i.sessionId, await canonical(i.sessionFile)]);
-  const scope = async (l: Lineage) => JSON.stringify([await identity(l.root), l.rootAssignmentId, l.rootCheckpoint,
-    l.rootBranchToken, await canonical(l.eventDirectory)]);
+  const scope = async (l: Lineage) => {
+    const root = JSON.stringify([await identity(l.root), await canonical(l.eventDirectory)]);
+    return { root, key: JSON.stringify([root, l.rootAssignmentId, l.rootCheckpoint, l.rootBranchToken]) };
+  };
   const provenance = async (l: Lineage) => {
-    const [key, parent, child] = await Promise.all([scope(l), identity(l.parent), identity(l.child)]);
+    const [{ key }, parent, child] = await Promise.all([scope(l), identity(l.parent), identity(l.child)]);
     return { scope: key, parent, child, key: JSON.stringify([key, parent, child]) };
   };
   const view: ProgressView = { title: null, tasks: [], unassigned: [] };
-  const incomplete = () => notices.add("Incomplete evidence; run counts are a lower bound");
+  const incomplete = () => {
+    view.incomplete = true;
+    notices.add("Incomplete evidence; run counts are a lower bound");
+  };
   const ancestors = new Map<string, Promise<string>>();
   function existingDirectory(path: string): Promise<string> {
     if (!ancestors.has(path)) ancestors.set(path, stat(path).then(info => {
@@ -164,6 +179,7 @@ async function project(manager: Manager, previous: Map<string, CachedEvent>, nex
             && Array.isArray(a.runIds) && a.runIds.length <= MAX_RUNS && a.runIds.every(string)))
         || new Set(p.tasks.map((t: any) => t.taskId)).size !== p.tasks.length) {
         notices.add("Unsupported or corrupt active plan; no fallback used");
+        incomplete();
       } else {
         view.title = text(p.title, 240) ?? "Untitled plan";
         if (p.authority.sessionId !== self.sessionId) notices.add("Foreign inherited plan (read-only); runs remain unassigned");
@@ -183,15 +199,18 @@ async function project(manager: Manager, previous: Map<string, CachedEvent>, nex
     }
     if (!anchors.length) for (const e of branch) if (e.type === "custom" && e.customType === "subagent-lineage-assignment/v1" && isLineage(e.data)) {
       if (await identity(e.data.root) === selfKey && custody(e.data.rootCheckpoint, e.data.rootBranchToken)) anchors.push(e.data);
-      else notices.add("History scope/branch mismatch ignored");
+      else { notices.add("History scope/branch mismatch ignored"); incomplete(); }
     }
-    const scopes = new Map<string, Set<string>>();
+    const scopes = new Map<string, { keys: Set<string>; roots: Set<string> }>();
     for (const anchor of anchors) {
       const directory = resolve(anchor.eventDirectory);
-      if (!scopes.has(directory)) scopes.set(directory, new Set());
-      scopes.get(directory)!.add(await scope(anchor));
+      if (!scopes.has(directory)) scopes.set(directory, { keys: new Set(), roots: new Set() });
+      const { key, root } = await scope(anchor);
+      const directoryScopes = scopes.get(directory)!;
+      directoryScopes.keys.add(key);
+      directoryScopes.roots.add(root);
     }
-    const authorized = new Set([...scopes.values()].flatMap(keys => [...keys]));
+    const authorized = new Set([...scopes.values()].flatMap(({ keys }) => [...keys]));
     type Provenance = Awaited<ReturnType<typeof provenance>>;
     const runs = new Map<string, { id: string; run: ProgressRun; lineage?: Lineage; custody?: Provenance; binding?: any; root: boolean; time?: number }>();
     function add(id: string, name: string, task: string, lineage: Lineage | undefined, root: boolean, key?: Provenance, time?: number) {
@@ -202,7 +221,7 @@ async function project(manager: Manager, previous: Map<string, CachedEvent>, nex
       }
       if (runs.size >= MAX_RUNS) { incomplete(); return undefined; }
       const label = text(id, 100) ?? "Run";
-      const entry = { id, run: { id: label, name: text(name, 100) || label, role: "unknown", task: text(task, 500) || "Assignment unavailable",
+      const entry = { id, run: { id: label, name: text(name, 100) ?? "", role: "unknown", task: text(task, 500) || "Assignment unavailable",
         status: root ? "SAVED" : "ASSIGNED", children: [] } as ProgressRun, lineage, root, time, custody: key, binding: undefined as any };
       runs.set(id, entry); return entry;
     }
@@ -221,10 +240,12 @@ async function project(manager: Manager, previous: Map<string, CachedEvent>, nex
     const m = await optional(join(runtimeDir, "manifest.json"));
     if (m !== undefined) {
       if (!object(m) || m.schema !== 1 || !object(m.parent) || !object(m.runs) || !object(m.outbox)
-        || !Number.isSafeInteger(m.revision) || m.revision < 0 || !string(m.generation)) notices.add("Unsupported or corrupt runtime manifest ignored");
-      else if (!string(m.parent.sessionFile) || await canonical(m.parent.sessionFile) !== self.sessionFile || m.parent.headerId !== self.sessionId
-        || !custody(m.parent.checkpoint, m.parent.branchToken)) notices.add("Runtime session/branch custody mismatch ignored");
-      else {
+        || !Number.isSafeInteger(m.revision) || m.revision < 0 || !string(m.generation)) {
+        notices.add("Unsupported or corrupt runtime manifest ignored"); incomplete();
+      } else if (!string(m.parent.sessionFile) || await canonical(m.parent.sessionFile) !== self.sessionFile || m.parent.headerId !== self.sessionId
+        || !custody(m.parent.checkpoint, m.parent.branchToken)) {
+        notices.add("Runtime session/branch custody mismatch ignored"); incomplete();
+      } else {
         if (m.custodyPaused) notices.add("Saved runtime custody paused; liveness unverified");
         let count = 0;
         for (const [id, r] of Object.entries(m.runs) as [string, any][]) {
@@ -245,7 +266,7 @@ async function project(manager: Manager, previous: Map<string, CachedEvent>, nex
     // No manifest references grant history access: only native active-branch anchors do.
     const events = new Map<string, { data: RecordData; key: Provenance; time: number }>();
     let scanned = 0;
-    for (const [directory, keys] of scopes) {
+    for (const [directory, { keys, roots }] of scopes) {
       await watch(directory, eventName);
       const batch: string[] = [];
       const gather = async () => {
@@ -260,8 +281,11 @@ async function project(manager: Manager, previous: Map<string, CachedEvent>, nex
               || !kinds.includes(data.kind) || typeof data.summary !== "string" || Buffer.byteLength(data.summary, "utf8") > 320
               || !string(data.timestamp) || !Number.isFinite(Date.parse(data.timestamp))
               || !Array.isArray(data.refs) || data.refs.length > 4 || !data.refs.every(string)) throw new Error("Invalid history event");
-            // Cache hits are still checked against the current branch's authorized scopes.
-            if (!keys.has(await scope(data.lineage))) throw new Error("History scope mismatch");
+            // Sibling assignments and inactive branches share the root history directory.
+            // Ignore those records without granting custody, even on cache hits.
+            const eventScope = await scope(data.lineage);
+            if (!roots.has(eventScope.root)) throw new Error("History root or directory mismatch");
+            if (!keys.has(eventScope.key)) return undefined;
             const key = await provenance(data.lineage);
             return { path, info, data, key, time: Date.parse(data.timestamp) };
           } catch { incomplete(); return undefined; }
@@ -286,13 +310,14 @@ async function project(manager: Manager, previous: Map<string, CachedEvent>, nex
       // Plan state/decision runIds may be task IDs: they are not run creation records.
       if (["state", "decision"].includes(e.kind)) continue;
       const assignment = e.kind === "assignment" || e.kind === "continuation";
-      const entry = add(e.runId, e.runId, e.kind === "assignment" ? e.summary : "", e.lineage, false, key);
+      const entry = add(e.runId, "", e.kind === "assignment" ? e.summary : "", e.lineage, false, key);
       if (!entry) continue;
       if (assignment && (entry.time === undefined || time < entry.time)) entry.time = time;
       if (e.kind === "assignment") entry.run.task = text(e.summary, 500) || entry.run.task;
       if (e.kind === "result" || e.kind === "failure" || e.kind === "ping") {
         entry.run.status = e.kind === "result" ? "RESULT REPORTED" : e.kind === "failure" ? "FAILURE REPORTED" : "HELP REQUESTED";
         entry.run.summary = e.kind === "failure" ? "Failure reported; requires parent review" : text(e.summary);
+        entry.run.historyExcerpt = e.kind !== "failure" && !!entry.run.summary;
       }
     }
     const profiles = new Map<string, Promise<any>>();
@@ -328,7 +353,14 @@ async function project(manager: Manager, previous: Map<string, CachedEvent>, nex
       seenFeedback.add(d.eventId);
       const failure = !!(d.error || d.errorMessage || (typeof d.exitCode === "number" && d.exitCode !== 0));
       entry.run.status = message.customType === "subagent_ping" ? "HELP REQUESTED" : failure ? "FAILURE REPORTED" : "RESULT REPORTED";
-      entry.run.summary = failure ? "Failure reported; requires parent review" : text(d.structuredResult?.summary) || text(d.response) || text(d.message);
+      const structured = !failure ? sanitizedText(d.structuredResult?.summary, true) : undefined;
+      const result = failure ? "Failure reported; requires parent review"
+        : sanitizedText(d.response, true) ?? sanitizedText(d.message, true) ?? structured;
+      entry.run.summary = excerpt(structured ?? result, MAX_PREVIEW);
+      const detailed = excerpt(result, MAX_NATIVE_RESULT);
+      entry.run.result = detailed === entry.run.summary ? undefined : detailed;
+      entry.run.historyExcerpt = false;
+      entry.run.resultStatus = text(d.structuredResult?.status, 40);
       entry.run.model = text(d.runtimePlan?.model, 120) || entry.run.model;
       entry.run.thinking = text(d.runtimePlan?.thinking, 30) || entry.run.thinking;
     }
@@ -381,7 +413,7 @@ async function project(manager: Manager, previous: Map<string, CachedEvent>, nex
       if (!anchors.length) incomplete();
       notices.add("Saved/assigned evidence only; results require parent review, not acceptance");
     }
-  } catch { notices.add("Progress evidence unavailable or incomplete"); }
+  } catch { incomplete(); notices.add("Progress evidence unavailable or incomplete"); }
   if (notices.size) view.notice = [...notices].join("; ");
   const watches = [...targets].flatMap(([directory, names]) => [...names].map(filename => ({ directory, filename })));
   return { view, watches };
