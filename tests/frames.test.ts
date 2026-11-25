@@ -80,5 +80,5 @@ test("mouse events ignore the right margin and use the rendered content width", 
 test("progress report reserves one outer margin, without repeatedly shrinking nested boxes", () => {
   const lines = renderProgress({ title: "Plan", tasks: [{ id: "T1", title: "Feature", status: "pending", runs: [] }], unassigned: [] }, 80, { details: true });
   for (const line of lines) assert.equal(visibleWidth(line), 78);
-  assert.ok(lines.some(line => line.includes("╭─ Task T1")));
+  assert.ok(lines.some(line => line.includes("Task T1: Feature")));
 });

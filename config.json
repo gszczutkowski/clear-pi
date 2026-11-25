@@ -21,7 +21,34 @@
       "color": "#D69E2E"
     }
   },
-  "progress": { "enabled": true, "details": false, "maxTasks": 12, "maxRuns": 20 },
+  "progress": {
+    "enabled": true,
+    "maxTasks": 12,
+    "maxRuns": 20,
+    "icons": {
+      "main": "󰙅", "agents": "󱙺", "info": "󰋼", "runtime": "󱞩", "checked": "󰱒", "unchecked": "󰄱",
+      "status": {
+        "pending": "󰋼", "in_progress": "󰋼", "in_review": "󰋼", "accepted": "󰄬", "failed": "󰅖",
+        "blocked": "󰂭", "skipped": "󰋼", "cancelled": "󰋼", "completed": "󰄬", "help_requested": "󰂭",
+        "saved": "󰋼", "assigned": "󰋼", "unknown": "󰋼", "complete": "󰄬", "partial": "󰀪", "changes_required": "󰀦"
+      },
+      "roles": {
+        "worker": { "normal": "󰢻", "problem": "󱏏" },
+        "tester": { "normal": "󰂕", "problem": "󱏵" },
+        "reviewer": { "normal": "󰛐", "problem": "󰛑" },
+        "documenter": { "normal": "󰨸", "problem": "󱘡" },
+        "scout": { "normal": "󰆌", "problem": "󰮁" },
+        "architect": { "normal": "󰺾", "problem": "󱕛" },
+        "coordinator": { "normal": "󱙺", "problem": "󱙻" },
+        "other": { "normal": "󱙺", "problem": "󱙻" }
+      }
+    }
+  },
+  "transcriptIcons": { "activity": "\uF449", "expanded": "▾", "collapsed": "▸" },
+  "transcriptNotices": {
+    "skill": { "enabled": true, "title": "Skill invoked", "color": "#FF9F43" },
+    "help": { "enabled": true, "title": "Needs help", "color": "#FF9F43" }
+  },
   "footer": {
     "cwd": { "enabled": true, "icon": "\uF07C" },
     "gitBranch": { "enabled": true, "icon": "\uEC6F" },

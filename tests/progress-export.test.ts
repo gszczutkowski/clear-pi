@@ -3,7 +3,7 @@ import test from "node:test";
 import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { progressIcons, renderProgress, type ProgressView } from "../progress-view.ts";
+import { renderProgress, type ProgressView } from "../progress-view.ts";
 import { renderProgressHtml, saveProgressExport } from "../progress-export.ts";
 
 const view: ProgressView = {
@@ -23,12 +23,12 @@ test("HTML preserves expanded projection, escapes content, and needs no scripts/
   const pre = html.match(/<pre>([\s\S]*?)<\/pre>/)![1];
   const decoded = pre.replaceAll("&lt;", "<").replaceAll("&gt;", ">").replaceAll("&quot;", '"')
     .replaceAll("&#39;", "'").replaceAll("&amp;", "&");
-  assert.equal(decoded, renderProgress(view, 140, { details: true }).join("\n")
-    .replaceAll(progressIcons.checked, "☑").replaceAll(progressIcons.unchecked, "☐"));
+  assert.equal(decoded, renderProgress(view, 140, { details: true, portable: true }).join("\n"));
   assert.match(decoded, /╭─ worker: Implement/);
-  assert.match(decoded, /☑ T1/);
-  assert.match(decoded, /☐ T2/);
-  assert.ok(!html.includes(progressIcons.checked));
+  assert.match(decoded, /Model: unknown · Thinking: unknown/);
+  assert.match(decoded, /Formal task state · T1/);
+  assert.match(decoded, /Formal task state · T2/);
+  assert.doesNotMatch(html, /\p{Co}/u);
 });
 
 test("export honors the same run limits and writes unique UTF-8 local reports", async () => {

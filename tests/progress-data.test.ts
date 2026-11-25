@@ -49,7 +49,7 @@ test("an accepted main-agent task needs no assignments or run artifacts to appea
     const { view } = await readProgress(f.manager);
     assert.deepEqual(view.tasks, [{ id: "feature", title: "The feature", status: "accepted", runs: [] }]);
     assert.deepEqual(view.unassigned, []);
-    assert.match(renderProgress(view, 80, { compact: true }).join("\n"), /Stages:[^\n]*\n[^\n]*\u{F0C52} T1 The feature/u);
+    assert.deepEqual(renderProgress(view, 80, { compact: true }), []);
   } finally { f.close(); }
 });
 
@@ -122,10 +122,9 @@ test("no guessed task names: exact binding/authority/attempt or attempt runIds o
     assert.equal(withoutPlan.title, null);
     assert.equal(withoutPlan.tasks.length, 0); assert.equal(withoutPlan.unassigned.length, 1);
     const compact = renderProgress(withoutPlan, 80, { compact: true }).join("\n");
-    assert.match(compact, /\[✓\] Implement feature  ·  completed/);
-    assert.match(compact, /└─ coordinator  ·  model  ·  high/);
+    assert.match(compact, /coordinator ⟦ 󱙺 ⟧ · Review complete/);
     assert.doesNotMatch(compact, /Stages:|Unassigned runs|Operations/);
-    assert.match(renderProgressHtml(withoutPlan), /Operations.*Status: completed/s);
+    assert.match(renderProgressHtml(withoutPlan), /coordinator: coordinator.*Delivery: completed/s);
   } finally { f.close(); }
 });
 
@@ -158,6 +157,37 @@ test("history only follows authorized scope; corrupt/unknown/event filename mism
     f.branch[1].data = { ...f.coordinator, rootBranchToken: "wrong" };
     const rejected = await readProgress(f.manager);
     assert.equal(rejected.view.unassigned.length, 0); assert.ok(!rejected.watches.some(w => w.directory === f.history));
+  } finally { f.close(); }
+});
+
+test("valid sibling scopes in the shared history directory neither contribute runs nor make counts incomplete", async () => {
+  const f = fixture(); try {
+    f.save();
+    const read = createProgressReader();
+    f.event("coordinator", f.coordinator, "result", "Active result");
+    const sibling = { ...f.lineage("sibling"), rootAssignmentId: "sibling-assignment" };
+    f.event("coordinator", sibling, "result", "Sibling must not replace active result", "2026-01-02T00:00:00Z");
+    const inactive = { ...sibling, rootCheckpoint: "inactive-checkpoint", rootBranchToken: "inactive-token" };
+    f.event("inactive", inactive, "assignment", "Inactive work");
+    const { view } = await read(f.manager);
+    assert.deepEqual(view.unassigned.map(run => [run.id, run.summary]), [["coordinator", "Active result"]]);
+    assert.ok(!view.incomplete);
+    assert.doesNotMatch(view.notice!, /lower bound/);
+
+    const foreign = { ...sibling, root: { ...f.root, sessionId: "foreign-root" } };
+    const misplaced = f.event("foreign", foreign, "assignment", "Foreign root claiming this directory");
+    const mismatch = await read(f.manager);
+    assert.deepEqual(mismatch.view.unassigned.map(run => run.id), ["coordinator"]);
+    assert.ok(mismatch.view.incomplete);
+    rmSync(join(f.history, `${misplaced.id}.json`));
+
+    const offDirectory = { ...sibling, eventDirectory: join(f.dir, "other-history") };
+    const misfiled = f.event("misfiled", offDirectory, "assignment", "Wrong history directory");
+    assert.ok((await read(f.manager)).view.incomplete);
+    rmSync(join(f.history, `${misfiled.id}.json`));
+
+    f.event("malformed-sibling", sibling, "result", "x".repeat(321));
+    assert.ok((await read(f.manager)).view.incomplete);
   } finally { f.close(); }
 });
 
@@ -200,6 +230,7 @@ test("native active-branch delivery enriches feedback and model; worker claims n
     assert.equal(view.tasks[0].status, "in_review");
     assert.equal(view.tasks[0].runs[0].status, "RESULT REPORTED");
     assert.equal(view.tasks[0].runs[0].summary, "All done (proposal)");
+    assert.equal(view.tasks[0].runs[0].resultStatus, "complete");
     assert.equal(view.tasks[0].runs[0].model, "reported/model");
     f.branch.push({ type: "custom_message", customType: "subagent_result", details: {
       eventId: "subagent:coordinator:completion:failure", lineage: f.coordinator, sessionFile: f.coordinator.child.sessionFile,
@@ -208,6 +239,113 @@ test("native active-branch delivery enriches feedback and model; worker claims n
     view = (await readProgress(f.manager)).view;
     assert.equal(view.tasks[0].runs[0].status, "FAILURE REPORTED");
     assert.ok(!JSON.stringify(view).includes("do-not-expose"));
+  } finally { f.close(); }
+});
+
+test("projected outcomes are consistent in all reports and ordinary prose is not a verdict", async () => {
+  const f = fixture();
+  try {
+    f.addPlan(); f.save();
+    const delivery = (event: string, details: object) => f.branch.push({ type: "custom_message", customType: "subagent_result", details: {
+      eventId: `subagent:coordinator:completion:${event}`, lineage: f.coordinator, sessionFile: f.coordinator.child.sessionFile, ...details,
+    } });
+    delivery("prose", { response: "Partial updates are now supported; all tests passed." });
+    let { view } = await readProgress(f.manager);
+    assert.match(renderProgress(view, 140).join("\n"), /⟦ 󱙺 ⟧/);
+    assert.match(renderProgressHtml(view), /Outcome: not recorded/);
+    delivery("heading", { response: "Checks completed.\n## Verdict: BLOCKED — awaiting approval" });
+    ({ view } = await readProgress(f.manager));
+    assert.match(renderProgress(view, 140).join("\n"), /⟦ 󱙻 ⟧/);
+    assert.match(renderProgressHtml(view), /Outcome: blocked/);
+    delivery("structured", {
+      response: "# Code Review\n**Verdict:** APPROVED\n\n## Summary\nThe review looks good.",
+      structuredResult: { status: "partial", summary: "Awaiting approval", artifacts: [], checks: [], unmetCriterionIds: [], risks: [] },
+    });
+    ({ view } = await readProgress(f.manager));
+    assert.match(renderProgress(view, 140).join("\n"), /⟦ 󱙻 ⟧/);
+    for (const text of [renderProgress(view, 140, { details: true }).join("\n"), renderProgressHtml(view)]) {
+      assert.match(text, /Status: in_review/);
+      assert.match(text, /Outcome: partial/);
+      assert.match(text, /Delivery: completed/);
+    }
+  } finally { f.close(); }
+});
+
+test("herdr review verdicts are proposals in native delivery and flattened v1 history", async t => {
+  const review = (verdict: string) => `# Code Review\n\n**Reviewed:** Progress projection\n**Verdict:** ${verdict}\n\n## Summary\nReviewed the result.\n\n## Checks\n**Status:** FAILED`;
+  for (const [name, response, expected] of [
+    ["approval", review("APPROVED"), "complete"],
+    ["changes requested", review("NEEDS CHANGES"), "changes required"],
+    ["standalone partial before checks", "PARTIAL\n\n## Checks\n**Status:** PASSED", "partial"],
+    ["fenced example preceding real review", "````markdown\n**Verdict:** APPROVED\n````text\n## Verdict: COMPLETE\n```\n````\n\n" + review("NEEDS CHANGES"), "changes required"],
+    ["fenced examples alone", "Review template:\n~~~markdown\n# Code Review\n**Verdict:** APPROVED\n## Status: PASSED\n~~~", "not recorded"],
+    ["unclosed fence", "Review template:\n```markdown\n**Verdict:** APPROVED\n## Summary\nExample", "not recorded"],
+    ["no verdict assembled across a fence", "# Code Review\n**Verdict:**\n```\nExample\n```\nAPPROVED\n## Summary", "not recorded"],
+    ["bare field inside prose", "Review notes mention Verdict: APPROVED", "not recorded"],
+  ]) for (const source of ["native", "history"] as const) {
+    await t.test(`${name} (${source})`, async () => {
+      const f = fixture(); try {
+        f.addPlan(); f.save();
+        if (source === "native") {
+          f.branch.push({ type: "custom_message", customType: "subagent_result", details: {
+            eventId: "subagent:coordinator:completion:review", lineage: f.coordinator,
+            sessionFile: f.coordinator.child.sessionFile, exitCode: 0, response,
+          } });
+        } else {
+          const reviewer = f.lineage("reviewer", f.coordinator.child);
+          f.event("reviewer", reviewer, "assignment", "Review the feature");
+          f.put(`${reviewer.child.sessionFile}.launch-profile.json`, f.profile(reviewer, "reviewer"));
+          // history.ts boundedSummary collapses whitespace before the UTF-8 cap.
+          f.event("reviewer", reviewer, "result", response.replace(/\s+/g, " ").trim(), "2026-01-02T00:00:00Z");
+        }
+        const { view } = await readProgress(f.manager);
+        const run = view.tasks[0].runs[0];
+        assert.equal(view.tasks[0].status, "in_review");
+        assert.equal((source === "native" ? run : run.children[0]).status, "RESULT REPORTED");
+        const outcomes = Array.from(renderProgressHtml(view).matchAll(/Outcome: ([a-z]+(?: [a-z]+)*)/g), match => match[1]);
+        assert.deepEqual(outcomes, [expected]);
+      } finally { f.close(); }
+    });
+  }
+});
+
+test("full reports retain bounded native result text beyond the summary preview", async () => {
+  const f = fixture();
+  try {
+    f.save();
+    f.branch.push({ type: "custom_message", customType: "subagent_result", details: {
+      eventId: "subagent:coordinator:completion:detailed", lineage: f.coordinator, sessionFile: f.coordinator.child.sessionFile,
+      response: "Notes ".repeat(70) + "SAVED-RESULT-TAIL\n" + "More notes ".repeat(400) + "OUTSIDE-BOUND",
+    } });
+    const { view } = await readProgress(f.manager);
+    const run = view.unassigned[0];
+    assert.ok(run.summary!.length <= 320 && run.summary!.endsWith("…"));
+    assert.ok(run.result!.length <= 4096 && run.result!.endsWith("…"));
+    const html = renderProgressHtml(view);
+    assert.match(html, /SAVED-RESULT-TAIL/);
+    assert.doesNotMatch(html, /OUTSIDE-BOUND/);
+  } finally { f.close(); }
+});
+
+test("v1 nested history preserves explicit Markdown verdicts but never infers missing structured data", async () => {
+  const f = fixture();
+  try {
+    f.save();
+    const child = f.lineage("reviewer", f.coordinator.child);
+    f.event("reviewer", child, "assignment", "Review the feature");
+    f.event("reviewer", child, "result", "Review notes ## Verdict: PARTIAL", "2026-01-02T00:00:00Z");
+    f.put(`${child.child.sessionFile}.launch-profile.json`, f.profile(child, "reviewer"));
+    const neutral = f.lineage("worker", f.coordinator.child);
+    f.event("worker", neutral, "assignment", "Implement the feature");
+    f.event("worker", neutral, "result", "Partial updates are supported.", "2026-01-02T00:00:00Z");
+    f.put(`${neutral.child.sessionFile}.launch-profile.json`, f.profile(neutral, "worker"));
+    const { view } = await readProgress(f.manager);
+    const summary = renderProgress(view, 140).join("\n");
+    assert.match(summary, /󰛑/);
+    assert.match(summary, /󰢻/);
+    const html = renderProgressHtml(view);
+    assert.match(html, /Excerpt: Review notes ## Verdict: PARTIAL[\s\S]*Outcome: partial/);
+    assert.match(html, /Excerpt: Partial updates are supported\.[\s\S]*Outcome: not recorded/);
   } finally { f.close(); }
 });
 
@@ -302,7 +440,7 @@ test("cache loads only new or changed event files and revalidates the current br
     f.branch[1].data = { ...f.coordinator, rootBranchToken: "other" };
     const rejected = await read(f.manager);
     assert.equal(rejected.view.unassigned.length, 0);
-    assert.match(rejected.view.notice!, /Incomplete evidence/);
+    assert.ok(!rejected.view.incomplete); // Previously authorized files are now valid siblings.
     assert.deepEqual(loaded, []);
   } finally { f.close(); }
 });

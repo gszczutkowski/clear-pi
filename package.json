@@ -3,11 +3,23 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "pi": { "extensions": ["./index.ts"] },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
   "scripts": {
     "test": "node --experimental-strip-types --import ./tests/register-pi.ts --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit",
     "bench:progress": "node --experimental-strip-types ./tests/progress-data.bench.ts",
+    "bench:progress-view": "node --experimental-strip-types --import ./tests/register-pi.ts ./tests/progress-view.bench.ts",
     "bench:transcript": "node --experimental-strip-types --import ./tests/register-pi.ts ./tests/tool-groups.bench.ts"
   },
-  "peerDependencies": { "@earendil-works/pi-coding-agent": "1.6.0" }
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "1.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "typescript": "5.9.3"
+  }
 }

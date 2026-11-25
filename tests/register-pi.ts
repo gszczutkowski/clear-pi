@@ -1,12 +1,14 @@
-// Use the host's TUI implementation without installing duplicate runtime packages.
+// Resolve both extension and test imports to the same Pi/TUI installation.
 import { registerHooks, createRequire } from "node:module";
 import { execSync } from "node:child_process";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
-const root = process.env.PI_PACKAGE_DIR ?? join(execSync("npm root -g", {
-  encoding: "utf8",
-}).trim(), "@earendil-works", "pi-coding-agent");
+function packageRoot(): string {
+  try { return fileURLToPath(new URL("../", import.meta.resolve("@earendil-works/pi-coding-agent"))); }
+  catch { return join(execSync("npm root -g", { encoding: "utf8" }).trim(), "@earendil-works", "pi-coding-agent"); }
+}
+const root = process.env.PI_PACKAGE_DIR ?? packageRoot();
 const require = createRequire(join(root, "package.json"));
 const tuiUrl = pathToFileURL(require.resolve("@earendil-works/pi-tui")).href;
 const agentUrl = pathToFileURL(join(root, "dist", "index.js")).href;

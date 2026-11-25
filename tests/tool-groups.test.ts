@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { AssistantMessageComponent, CustomMessageComponent, initTheme, ToolExecutionComponent, UserMessageComponent, type Theme } from "@earendil-works/pi-coding-agent";
+import { AssistantMessageComponent, CustomMessageComponent, initTheme, SkillInvocationMessageComponent, ToolExecutionComponent, UserMessageComponent, type Theme } from "@earendil-works/pi-coding-agent";
 import { Container, foregroundAnsi, getCapabilities, getTerminalColorMode, parseColor, setCapabilities, stripTerminalSequences, Text, visibleWidth, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { mountToolGroups } from "../tool-groups.ts";
-import { parseSettings, type Settings } from "../config.ts";
+import { parseSettings, type Settings, type TranscriptIcons } from "../config.ts";
 
 initTheme("dark", false);
 const theme = { fg: (_token: string, text: string) => text } as Theme;
@@ -17,10 +17,11 @@ function setup(arrowTheme = theme) {
   ui.addChild(document);
   const tui = ui as unknown as TUI;
   let globalExpanded = false;
-  const mount = (frames?: Settings["frames"]) => mountToolGroups(tui, arrowTheme, () => globalExpanded, frames);
+  const mount = (frames?: Settings["frames"], icons?: TranscriptIcons) => mountToolGroups(tui, arrowTheme, () => globalExpanded, frames, icons);
   const setGlobal = (expanded: boolean) => {
     globalExpanded = expanded;
-    for (const row of chat.children) if (row instanceof ToolExecutionComponent) row.setExpanded(expanded);
+    for (const row of chat.children) if (row instanceof ToolExecutionComponent || row instanceof SkillInvocationMessageComponent
+      || row instanceof CustomMessageComponent) row.setExpanded(expanded);
   };
   let nextId = 0;
   const tool = (name: string, args: Record<string, unknown>) => {
@@ -176,6 +177,124 @@ test("only visible lines become titles, and groups do not cross user messages", 
   cleanup();
 });
 
+test("non-expandable activity has a marker and three-column hanging indent", () => {
+  const { mount, assistant, tool, render, mouse } = setup();
+  const cleanup = mount(parseSettings(undefined).frames);
+  assistant("Reading relevant docs");
+  assistant("Usunę te komendy, zaktualizuję dokumentację i testy. Automatyczne odświeżanie limitów pozostanie bez zmian.");
+  assistant("Running tests");
+  tool("bash", { command: "npm test" });
+  assistant("Done");
+  try {
+    const lines = render(48);
+    const start = lines.findIndex(line => line.includes("\uF449 Usunę"));
+    assert.ok(start >= 0);
+    assert.ok(lines.some(line => line.includes("\uF449 Reading relevant docs")));
+    assert.match(lines[start + 1], /^│ {3}\S/); // Two-column hanging indent plus frame padding.
+    assert.match(lines[start + 2], /^│ {3}\S/);
+    assert.ok(lines.some(line => line.includes("▸ Running tests")));
+    assert.ok(lines.every(line => visibleWidth(line) <= 48));
+    assert.equal(mouse(start, { x: 2 })?.handled, undefined);
+    assert.ok(lines.some(line => line.includes("Done") && !line.includes("\uF449")));
+  } finally { cleanup(); }
+});
+
+test("streaming activity keeps markers and puts a new tool arrow on the first wrapped line", () => {
+  const { mount, assistant, tool, render, mouse } = setup();
+  const cleanup = mount(parseSettings(undefined).frames);
+  try {
+    assistant("Reading relevant docs");
+    const message = "Usunę te komendy, zaktualizuję dokumentację i testy. Automatyczne odświeżanie limitów oraz /clear-progress pozostaną bez zmian.";
+    const pending = assistant(message);
+    pending.updateContent({ content: [{ type: "text", text: message },
+      { type: "toolCall", id: "pending", name: "bash", arguments: { command: "npm test" } }],
+      stopReason: "toolUse" } as Parameters<typeof pending.updateContent>[0], true);
+    let lines = render();
+    assert.ok(lines.some(line => line.includes("\uF449 Reading relevant docs")));
+    assert.ok(lines.some(line => line.includes("\uF449 Usunę")));
+    tool("bash", { command: "npm test" });
+    lines = render();
+    const title = lines.findIndex(line => line.includes("▸ Usunę"));
+    assert.ok(title >= 0);
+    assert.match(lines[title + 1], /^│ {3}\S/);
+    assert.ok(!lines[title + 1].includes("▸"));
+    assert.ok(lines.some(line => line.includes("\uF449 Reading relevant docs")));
+    assert.equal(mouse(title, { x: 2 })?.handled, true);
+    lines = render();
+    assert.ok(lines.some(line => line.includes("▾ Usunę")));
+    assert.ok(lines.some(line => line.includes("npm test")));
+    assert.ok(lines.every(line => visibleWidth(line) <= width));
+  } finally { cleanup(); }
+});
+
+test("framed activity renders natively once at the wrapping width and routes mouse against that layout", (t) => {
+  const { mount, assistant, tool, render, mouse } = setup();
+  const cleanup = mount(parseSettings(undefined).frames);
+  t.after(cleanup);
+  assistant("Getting started");
+  const activity = assistant("Checking " + "the configured output width ".repeat(6));
+  const nativeRender = t.mock.method(activity, "render");
+  const nativeMouse = t.mock.method(activity, "handleMouse");
+  tool("bash", { command: "npm test" });
+  const lines = render();
+  const title = lines.findIndex((line) => line.includes("▸ Checking"));
+  assert.ok(title >= 0);
+  // Two outer margin cells, four border/padding cells, and one marker column.
+  const nativeWidth = width - 7;
+  assert.deepEqual(nativeRender.mock.calls.map(({ arguments: [columns] }) => columns), [nativeWidth]);
+  assert.match(lines[title + 1], /^│ {3}\S/);
+  mouse(title + 1, { x: 5 });
+  assert.deepEqual(nativeMouse.mock.calls.map(({ arguments: [event] }) => [event.x, event.y, event.width]), [[2, 2, nativeWidth]]);
+  assert.equal(mouse(title, { x: 2 })?.handled, true);
+  assert.match(render().join("\n"), /▾ Checking[\s\S]*npm test/);
+});
+
+test("custom transcript icons decorate framed activity, thinking, and tool toggles", (t) => {
+  for (const activity of ["*", ""]) {
+    const { mount, assistant, tool, render, mouse } = setup();
+    const cleanup = mount(parseSettings(undefined).frames, { activity, expanded: "v", collapsed: ">" });
+    t.after(cleanup);
+    tool("bash", { command: "echo fallback" });
+    assistant("Standalone update");
+    assistant("Expandable update");
+    tool("bash", { command: "echo inline" });
+    assistant("Done", "Final check");
+    const lines = render();
+    const expectedMarker = activity || " ";
+    assert.ok(lines.some((line) => line.includes(`│ ${expectedMarker} Standalone update`)));
+    assert.ok(lines.some((line) => line.includes(`│ ${expectedMarker} Final check`)));
+    assert.doesNotMatch(lines.join("\n"), /[▸▾\uF449]/u);
+    assert.equal(mouse(lines.findIndex((line) => line.includes("> Agent research")), { x: 2 })?.handled, true);
+    assert.equal(mouse(render().findIndex((line) => line.includes("> Expandable update")), { x: 2 })?.handled, true);
+    assert.match(render().join("\n"), /v Agent research[\s\S]*echo fallback[\s\S]*v Expandable update[\s\S]*echo inline/);
+  }
+});
+
+test("custom arrows also work without frames", (t) => {
+  const { mount, assistant, tool, render, mouse } = setup();
+  t.after(mount(undefined, { activity: "*", expanded: "v", collapsed: ">" }));
+  tool("bash", { command: "echo fallback" });
+  assistant("Expandable update");
+  tool("bash", { command: "echo inline" });
+  assert.deepEqual(render(), ["> AI tools", "", "> Expandable update"]);
+  assert.equal(mouse(2)?.handled, true);
+  assert.match(render().join("\n"), /v Expandable update[\s\S]*echo inline/);
+});
+
+test("an image-first activity keeps raw transport and a separate clickable tool heading", (t) => {
+  const { mount, assistant, tool, render, ui, mouse } = setup();
+  t.after(mount(parseSettings(undefined).frames));
+  const image = "\x1b_Ga=T;fixture\x1b\\";
+  assistant("Illustrated update").render = () => ["", image, " Native caption"];
+  tool("bash", { command: "echo result" });
+  const raw = ui.render(width);
+  assert.ok(raw.includes(image));
+  assert.match(render().join("\n"), /\uF449 Native caption[\s\S]*▸ Agent research/);
+  assert.equal(raw.filter((line) => line.includes("▸")).length, 1);
+  assert.equal(mouse(raw.findIndex((line) => line.includes("▸ Agent research")), { x: 2 })?.handled, true);
+  assert.match(render().join("\n"), /▾ Agent research[\s\S]*echo result/);
+});
+
 test("frames prompt, grouped activity, and answer; preserves mouse coordinates", () => {
   const { chat, ui, mount, tool, assistant, render, mouse } = setup();
   const frames = parseSettings(undefined).frames;
@@ -213,17 +332,17 @@ test("the prompt uses terminal defaults and the activity body uses one gray, wit
     chat.addChild(prompt);
     tool("bash", { command: "echo first" }).updateResult({ content: [{ type: "text", text: "First result" }] });
     const wide = assistant("Wide status");
-    wide.render = columns => [`\x1b[30;47m${"x".repeat(columns)}\x1b[0m`]; // An arrow cannot fit inline.
+    wide.render = columns => [`\x1b[30;47m${"x".repeat(columns)}\x1b[0m`]; // Exercise a full-width native row.
     tool("bash", { command: "echo second" });
     const lines = render();
-    assert.deepEqual(lines.filter(line => line.includes("▸")).map(line => line.match(/▸ [^│]+/)?.[0].trim()), ["▸ Agent research", "▸ AI tools"]);
+    assert.deepEqual(lines.filter(line => line.includes("▸")).map(line => line.match(/▸ [^│]+/)?.[0].trim()), ["▸ Agent research", `▸ ${"x".repeat(72)}`]);
     assert.equal(mouse(lines.findIndex(line => line.includes("Agent research")), { x: 2 })?.handled, true);
     const gray = foregroundAnsi(parseColor(appearance === "light" ? "#595959" : "#b0b0b0"), getTerminalColorMode());
     assert.ok(gray);
     const styled = ui.render(width);
     const promptLine = styled.find(line => line.includes("Prompt body"))!;
     assert.doesNotMatch(promptLine, /\x1b\[(?:48[;:]|4[0-7]m|10[0-7]m)/);
-    for (const fragment of ["▾ Agent research", "echo first", "First result", "xxxx", "▸ AI tools"]) {
+    for (const fragment of ["▾ Agent research", "echo first", "First result", "xxxx", "▸ xxxx"]) {
       const line = styled.find(line => stripTerminalSequences(line).includes(fragment))!;
       const body = line.slice(line.indexOf("│") + 1, line.lastIndexOf("│"));
       assert.ok(body.includes(gray));
@@ -315,6 +434,8 @@ test("cached historical tool groups refresh theme and expansion and route mouse 
     ...theme, get appearance() { return appearance; },
   } as Theme);
   const styledArrow = (hex: string) => `${foregroundAnsi(parseColor(hex), getTerminalColorMode())}▸`;
+  chat.addChild(new UserMessageComponent("First historical prompt"));
+  const unaffected = trackRenders(assistant("Unaffected history"));
   chat.addChild(new UserMessageComponent("Historical prompt"));
   const activity = assistant("Historical progress");
   const row = tool("bash", { command: "echo historical" });
@@ -331,6 +452,8 @@ test("cached historical tool groups refresh theme and expansion and route mouse 
   assert.ok(ui.render(width).some((line) => line.includes(styledArrow("#595959"))));
   assert.ok(count() > before);
   const afterTheme = count();
+  const unaffectedBeforeClicks = unaffected();
+  assert.ok(unaffectedBeforeClicks > 0);
   const header = () => render().findIndex((line) => /[▸▾] Historical progress/.test(line));
   assert.equal(mouse(header(), { x: 2 })?.handled, true);
   assert.match(render().join("\n"), /▾ Historical progress[\s\S]*Historical tool result/);
@@ -342,6 +465,7 @@ test("cached historical tool groups refresh theme and expansion and route mouse 
   const recached = count();
   render();
   assert.equal(count(), recached);
+  assert.equal(unaffected(), unaffectedBeforeClicks); // Individual toggles must not re-render unrelated history.
   setGlobal(true);
   assert.match(render().join("\n"), /▾ Historical progress[\s\S]*Historical tool result/);
   setGlobal(false);
@@ -376,4 +500,61 @@ test("expanded historical tool images remain live and preserve raw Kitty transpo
     cleanup();
     setCapabilities(capabilities);
   }
+});
+
+
+test("skill and help notices expand independently by mouse and follow Ctrl+O", (t) => {
+  const { chat, tui, render, mouse } = setup();
+  chat.addChild(new SkillInvocationMessageComponent({ name: "release-create-notes", location: "/skill/SKILL.md",
+    content: "Private skill instructions\n\nSecond paragraph", userMessage: undefined }));
+  chat.addChild(new CustomMessageComponent({ role: "custom", customType: "subagent_ping", display: true, timestamp: 0,
+    content: "native notice", details: { name: "F10.C kontynuacja testu styku", agent: "feature-coordinator", sessionFile: "/sessions/worker.jsonl",
+      message: "R2 worker exited without structured output. " + "native/regression artifact ".repeat(12) + "\nSecond line of help.", keepOpen: true } }));
+  let expanded = false;
+  t.after(mountToolGroups(tui, theme, () => expanded, parseSettings(undefined).frames, undefined,
+    () => "Use this skill to create release notes for a system fix version."));
+  const text = () => render().join("\n");
+  const fitted = () => {
+    for (const columns of [1, 5, 8, 20, 80, 120]) assert.ok(render(columns).every((line) => visibleWidth(line) <= columns));
+  };
+  fitted();
+  assert.match(text(), /▸ Skill invoked[\s\S]*Name: +release-create-notes[\s\S]*Description: +Use this skill/);
+  assert.match(text(), /▸ Needs help[\s\S]*Role: +feature-coordinator[\s\S]*Preview: +R2 worker/);
+  assert.doesNotMatch(text(), /Private skill instructions|Second line of help|worker\.jsonl|native notice/);
+  const orange = foregroundAnsi(parseColor("#FF9F43"), getTerminalColorMode());
+  assert.ok(tui.render(width).some((line) => line.startsWith(orange + "╭")));
+  const heading = (title: string) => render().findIndex((line) => line.startsWith("╭") && line.includes(title));
+  assert.equal(mouse(heading("Skill invoked"), { x: width - 1 }), undefined);
+  assert.equal(mouse(heading("Skill invoked"), { x: 3, button: "right" }), undefined);
+  assert.equal(mouse(heading("Skill invoked"), { x: 3 })?.handled, true);
+  assert.match(text(), /▾ Skill invoked[\s\S]*Instructions: +Private skill instructions[\s\S]*Second paragraph/);
+  assert.match(text(), /▸ Needs help/);
+  assert.equal(mouse(heading("Needs help"), { x: 3 })?.handled, true);
+  assert.match(text(), /▾ Needs help[\s\S]*Request: +R2 worker[\s\S]*Second line of help[\s\S]*Session: +\/sessions\/worker.jsonl[\s\S]*kept open/);
+  assert.doesNotMatch(text(), /Preview:/);
+  fitted();
+  assert.equal(mouse(heading("Skill invoked"), { x: 3 })?.handled, true);
+  assert.doesNotMatch(text(), /Private skill instructions/);
+  assert.match(text(), /Second line of help/);
+  expanded = true;
+  assert.match(text(), /▾ Skill invoked[\s\S]*▾ Needs help/);
+  expanded = false;
+  assert.match(text(), /▸ Skill invoked[\s\S]*▸ Needs help/);
+  assert.doesNotMatch(text(), /Private skill instructions|Second line of help/);
+});
+
+test("notice settings restore native rendering and customize titles and arrows independently", (t) => {
+  const { chat, render, tui, setGlobal } = setup();
+  chat.addChild(new SkillInvocationMessageComponent({ name: "skill-title", location: "/skill/SKILL.md",
+    content: "Native expanded skill", userMessage: undefined }));
+  chat.addChild(new CustomMessageComponent({ role: "custom", customType: "subagent_ping", display: true, timestamp: 0,
+    content: "Native help fallback", details: {} }));
+  chat.addChild(new CustomMessageComponent({ role: "custom", customType: "subagent_ping", display: true, timestamp: 0,
+    content: "Original help text", details: { name: "worker", message: "Some help" } }));
+  const settings = parseSettings({ transcriptNotices: { skill: { enabled: false }, help: { title: "Assistance" } },
+    transcriptIcons: { collapsed: ">", expanded: "v" } });
+  t.after(mountToolGroups(tui, theme, () => false, settings.frames, settings.transcriptIcons, undefined, settings.transcriptNotices));
+  assert.match(render().join("\n"), /\[skill\].*skill-title[\s\S]*Native help fallback[\s\S]*> Assistance/);
+  setGlobal(true);
+  assert.match(render().join("\n"), /Native expanded skill/);
 });

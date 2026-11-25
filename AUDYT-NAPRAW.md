@@ -18,7 +18,17 @@
 - [x] **Nie przypisywać potomka do późniejszego wznowienia rodzica.** Gdy brak potwierdzonego wcześniejszego rodzica, run zostaje nieprzypisany, a raport sygnalizuje niepełne dane. Wynik subagenta nie zmienia stanu akceptacji zadania.
 - [x] **Udokumentować i testować zgodność z Pi.** `package.json` deklaruje sprawdzoną wersję **Pi 1.6.0**. Test integracyjny używa faktycznego runtime i TUI Pi z symulowanym terminalem i dostawcą offline. Obejmuje streaming, tryb zwykły i fullscreen, natywną kartę narzędzia, mysz, zmianę gałęzi i natywny widok przy nieznanym układzie. Nie deklarujemy zgodności z innymi wersjami ani nie weryfikujemy fizycznego terminala.
 
-## Bieżąca weryfikacja przed PR
+## Kolejna runda napraw po review
+
+- [x] Raport nie myli werdyktu agenta ze statusem pojedynczego testu, pomija przykłady w blokach kodu i rozpoznaje `APPROVED` / `NEEDS CHANGES` herdr jako deklarowane wyniki, nie formalną akceptację.
+- [x] `expand` i `full` czekają na aktualne dane po zdarzeniu obserwatora i odczytują pliki na żądanie, gdy obserwacja nie obejmuje całego zakresu. Eksport pozostaje oparty na cache. Poprawne dane siostrzanych uruchomień nie wpływają na liczniki aktywnego zakresu.
+- [x] Pojedyncze kliknięcie grupy narzędzi unieważnia tylko jej fragment transkryptu. Benchmark mierzy teraz również render po kliknięciu.
+- [x] Karty **Skill invoked** i **Needs help** można rozwinąć kliknięciem w fullscreen albo wspólnym `Ctrl+O`; konfiguracja pozwala przywrócić natywną kartę dla każdego typu. Nieznane klucze konfiguracji zgłaszają ostrzeżenie przy wczytywaniu.
+- [x] Stopka Codex nie myli pojedynczego okna `secondary` z `primary`, gdy brak czasu trwania.
+
+Weryfikacja: Node 24.21.0, Pi 1.6.0, `npm run typecheck`, **156/156** testów i trzy benchmarki. Kliknięcie grupy w próbce 500 tur wywołało **4** rendery wiadomości asystenta i zajęło ok. **0,40 ms** (mediana siedmiu pomiarów samego renderu, bez zapisu do terminala). Test integracyjny potwierdził obsługę kart myszą i `Ctrl+O` w symulowanym terminalu; nie uruchamiano rzeczywistego herdr ani endpointu Codex.
+
+## Weryfikacja wcześniejszej rundy (historyczna)
 
 - `npm test`: **92/92 PASS**, bez pominiętych testów (Node 24.21.0, Pi 1.6.0).
 - `git diff --check`: bez błędów białych znaków; Git ostrzega o lokalnej konwersji LF/CRLF.

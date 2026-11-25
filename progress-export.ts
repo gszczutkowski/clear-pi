@@ -1,17 +1,17 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { progressIcons, renderProgress, type ProgressView } from "./progress-view.ts";
+import { renderProgress, type PreparedProgress, type ProgressView } from "./progress-view.ts";
+
+type ExportOptions = { maxTasks?: number; maxRuns?: number; prepared?: PreparedProgress };
 
 const escapeHtml = (text: string) => text.replace(/[&<>"']/g, char => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
 })[char]!);
 
-/** Same bounded detailed projection as expand, without viewport clipping.
- * Standard Unicode checkbox fallbacks keep the file independent of Nerd Fonts. */
-export function renderProgressHtml(view: ProgressView, options: { maxTasks?: number; maxRuns?: number } = {}): string {
-  const report = renderProgress(view, 140, { ...options, details: true }).join("\n")
-    .replaceAll(progressIcons.unchecked, "☐").replaceAll(progressIcons.checked, "☑");
+/** Same detailed renderer as Full, with a portable palette instead of terminal glyphs. */
+export function renderProgressHtml(view: ProgressView, options: ExportOptions = {}): string {
+  const report = renderProgress(view, 140, { ...options, details: true, portable: true }).join("\n");
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -32,7 +32,6 @@ font-family: "Cascadia Mono", "DejaVu Sans Mono", Consolas, monospace; font-size
 }
 
 /** Explicit local export only; unique filenames never overwrite another report. */
-type ExportOptions = { maxTasks?: number; maxRuns?: number };
 export function saveProgressExport(view: ProgressView, directory: string, options?: ExportOptions): Promise<string>;
 export function saveProgressExport(view: ProgressView, directory: string, options: ExportOptions, current: () => boolean): Promise<string | undefined>;
 export async function saveProgressExport(view: ProgressView, directory: string,
