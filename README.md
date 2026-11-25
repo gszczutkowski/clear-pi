@@ -11,6 +11,40 @@ Other extensions' nonempty `setStatus` texts appear on one optional third line; 
 
 For a global installation, place the `clear-pi` directory under `~/.pi/agent/extensions/` (or configure it as an extension path), then start Pi 1.6.0 or run `/reload` in an existing interactive session. No additional runtime packages are required beyond Pi and its bundled libraries.
 
+## Installation and releases
+
+Install a versioned release directly in Pi (replace `2.0.0` with an existing release):
+
+```sh
+pi install git:github.com/gszczutkowski/clear-pi@v2.0.0
+```
+
+Do not also load a manual copy under `~/.pi/agent/extensions/`: that would load the extension twice. Pi 1.6.0 is the supported host. Node.js 24 or later is required by this package.
+
+Every PR must increase the stable SemVer version in `package.json` and `package-lock.json` and add a matching entry to `CHANGELOG.md`. Use patch for fixes/maintenance (including docs/CI-only PRs), minor for compatible features and major for breaking changes. See [AGENTS.md](./AGENTS.md). CI checks that the version is greater than the latest `main`; if another PR takes your version first, update your PR before merging.
+
+Every push to `main`, including a PR merged using GitHub's merge, squash or rebase option, runs `.github/workflows/release.yml`. It verifies and packages **exactly that event's commit**, creates `vX.Y.Z` from the reviewed package version and publishes a GitHub Release with `clear-pi-X.Y.Z.tgz`. It never changes files, commits or pushes to `main`, and does not apply an additional version bump. The Git tag, manifest, changelog and tarball therefore share the same version. Each event gets its own run, without replacing pending releases.
+
+Keep **Restrict deletions**, **Require a pull request before merging** and **Block force pushes** enabled for `main`. No branch bypass or GitHub App is needed. Under the PR rule, require the **verify** check from the **CI** workflow and enable **Require branches to be up to date before merging** (under required status checks). This ensures a second PR cannot reuse a version after the first merges. Run CI once if the check is not yet available to select.
+
+GitHub Actions needs `contents: write` (declared in the release workflow) to create tags and Releases. Repository/organization policy must allow that permission; if needed, select **Read and write permissions** under **Settings → Actions → General**. Any separate tag ruleset must allow Actions to create `v*` tags. Do not grant permission to force-update or delete release tags. No npm credentials or permission to create/approve PRs are needed.
+
+CI also runs on pull requests and uploads a preview `.tgz` artifact. Release tarballs contain the TypeScript runtime sources (Pi loads them directly), configuration, README and changelog, not tests, development dependencies or CI files. To use a downloaded tarball without Git:
+
+```sh
+mkdir clear-pi-release
+tar -xzf clear-pi-2.0.0.tgz -C clear-pi-release
+pi install ./clear-pi-release/package
+```
+
+Keep the extracted directory: local Pi installations reference it rather than copying it. Review the package before installing, as extensions execute code.
+
+To prepare a PR, run `npm version patch --no-git-tag-version` (or `minor` / `major`) and add the changelog entry. To verify locally, run `git fetch origin main`, `npm ci`, `npm run check:version -- --base origin/main`, `npm run typecheck`, `npm test`, `npm run check:package`, then `npm run pack`. No compilation step is necessary.
+
+Packages include the `pi-package` discovery keyword and an explicit Pi extension manifest. This workflow does **not** publish to npm or automatically list the project in the pi.dev gallery. Publishing to npm (after checking name availability and configuring registry authentication) is a separate opt-in step; GitHub-tag installation works without it.
+
+If publication fails, rerun the failed release job in GitHub Actions. It keeps the same version and source SHA, accepts an existing tag only when it points to that SHA, and creates the Release or replaces its package asset. It never moves an existing tag to another commit. A version collision with different source fails explicitly and must be resolved in a new PR with a higher version, not by deleting or moving the old tag.
+
 ## Configuration
 
 Edit [`config.json`](./config.json) next to `index.ts`, then run `/reload`. This file is extension-wide, not read from the current working directory. Missing or invalid values fall back to the defaults. Pi shows a warning for malformed files and unknown keys, including typos in nested options.

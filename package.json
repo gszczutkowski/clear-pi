@@ -1,7 +1,6 @@
 {
   "name": "clear-pi",
-  "version": "1.0.0",
-  "private": true,
+  "version": "2.0.0",
   "type": "module",
   "pi": {
     "extensions": [
@@ -13,13 +12,36 @@
     "typecheck": "tsc --noEmit",
     "bench:progress": "node --experimental-strip-types ./tests/progress-data.bench.ts",
     "bench:progress-view": "node --experimental-strip-types --import ./tests/register-pi.ts ./tests/progress-view.bench.ts",
-    "bench:transcript": "node --experimental-strip-types --import ./tests/register-pi.ts ./tests/tool-groups.bench.ts"
+    "bench:transcript": "node --experimental-strip-types --import ./tests/register-pi.ts ./tests/tool-groups.bench.ts",
+    "pack": "npm pack",
+    "check:package": "node scripts/check-package.mjs",
+    "check:version": "node scripts/check-version.mjs"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "1.6.0"
+    "@earendil-works/pi-coding-agent": "1.6.0",
+    "@earendil-works/pi-tui": "*"
   },
   "devDependencies": {
     "@types/node": "24.19.2",
-    "typescript": "5.9.3"
-  }
+    "typescript": "5.9.3",
+    "@earendil-works/pi-coding-agent": "1.6.0"
+  },
+  "description": "Transcript frames, tool-call grouping and a compact status footer for Pi",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "extension"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gszczutkowski/clear-pi.git"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "files": [
+    "/*.ts",
+    "/config.json",
+    "/CHANGELOG.md"
+  ]
 }
