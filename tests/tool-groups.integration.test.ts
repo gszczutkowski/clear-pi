@@ -137,6 +137,14 @@ test("installed Pi 1.6.0: streaming, fullscreen mouse, tree rebuild, regular mod
   manager.appendCustomMessageEntry("subagent_ping", "Fixture native help", true, {
     name: "Fixture worker", agent: "worker", message: "Help preview\nFull request from fixture", sessionFile: "/sessions/fixture.jsonl",
   });
+  const assignment = message("");
+  assignment.content = [{ type: "toolCall", id: "fixture-assignment", name: "subagent", arguments: {
+    name: "Reviewer", task: "Review fixture\nFull outgoing fixture message",
+  } }];
+  manager.appendMessage(assignment);
+  manager.appendMessage({ role: "toolResult", toolCallId: "fixture-assignment", toolName: "subagent",
+    content: [{ type: "text", text: "Started" }], isError: false, timestamp: Date.now() });
+  manager.appendCustomMessageEntry("subagent_result", "Scout preview\nFull incoming fixture message", true, { name: "Scout" });
   manager.appendMessage({ role: "user", content: "Shared prompt", timestamp: Date.now() });
   const shared = manager.appendMessage(message("Shared answer"));
   manager.appendMessage({ role: "user", content: "Alternate branch prompt", timestamp: Date.now() });
@@ -165,17 +173,33 @@ test("installed Pi 1.6.0: streaming, fullscreen mouse, tree rebuild, regular mod
     assert.match(writes, /\x1b\[\?1049h/);
     assert.equal(typeof exerciseFallback, "function", stripTerminalSequences(writes));
     assert.match(text(), /User prompt[\s\S]*Shared prompt[\s\S]*Agent answer[\s\S]*Shared answer/);
-    assert.match(text(), /▸ Skill invoked[\s\S]*▸ Needs help[\s\S]*Help preview/);
+    assert.match(text(), /▸ Skill invoked[\s\S]*▸ I have received message from Fixture worker \(worker\): Help preview/);
     assert.doesNotMatch(text(), /Alternate branch|Fixture skill instructions|Full request from fixture/);
-    const helpY = screen().findIndex(line => line.includes("▸ Needs help"));
+    assert.match(text(), /sent the message to Reviewer: Review fixture[\s\S]*received message from Scout: Scout preview/);
+    const clickMessage = (label: string) => {
+      const lines = screen();
+      const y = lines.findIndex(line => line.includes(label));
+      assert.ok(y >= 0, label);
+      const x = visibleWidth(lines[y].split("▸")[0]);
+      input(`\x1b[<0;${x + 1};${y + 1}M`);
+      input(`\x1b[<0;${x + 1};${y + 1}m`);
+    };
+    clickMessage("sent the message to Reviewer");
+    assert.match(text(), /Full outgoing fixture message/);
+    assert.doesNotMatch(text(), /Full incoming fixture message/);
+    clickMessage("received message from Scout");
+    assert.match(text(), /Full incoming fixture message/);
+    clickMessage("sent the message to Reviewer");
+    clickMessage("received message from Scout");
+    const helpY = screen().findIndex(line => line.includes("▸ I have received"));
     input(`\x1b[<0;4;${helpY + 1}M`);
     input(`\x1b[<0;4;${helpY + 1}m`);
-    assert.match(text(), /▸ Skill invoked[\s\S]*▾ Needs help[\s\S]*Full request from fixture[\s\S]*fixture\.jsonl/);
+    assert.match(text(), /▸ Skill invoked[\s\S]*▾ I have received[\s\S]*Full request from fixture/);
     assert.doesNotMatch(text(), /Fixture skill instructions/);
     input("\x0f");
     assert.match(text(), /▾ Skill invoked[\s\S]*Fixture skill instructions/);
     input("\x0f");
-    assert.match(text(), /▸ Skill invoked[\s\S]*▸ Needs help/);
+    assert.match(text(), /▸ Skill invoked[\s\S]*▸ I have received/);
     assert.doesNotMatch(text(), /Fixture skill instructions|Full request from fixture/);
     main = runtime.session.prompt("Main branch prompt");
     for (let retry = 0; retry < 100 && !text().includes("Streaming progress"); retry++) await delay(10);

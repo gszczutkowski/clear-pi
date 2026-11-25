@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.1.0]
+
+- Integrate incoming subagent reports, help requests, assignments and follow-up messages into the activity frame instead of separate message cards.
+- Show directional message previews with independently expandable full content and global Ctrl+O support.
+- Add regression coverage with native Pi transcript components and document legacy message-frame settings.
+
 ## [2.0.0]
 
 ### Breaking changes
